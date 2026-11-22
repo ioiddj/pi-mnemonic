@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_PROMPTS } from "./prompt-defaults.ts";
+import { AtomicWriteText } from "./file-lock.ts";
 
 const EXTENSION_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const PROMPT_DIR = path.join(EXTENSION_DIR, ".config", "prompts");
@@ -114,19 +115,25 @@ export function WritePromptCard(key: string, prompt: string): string {
 	if (!Object.prototype.hasOwnProperty.call(DEFAULT_PROMPTS, key)) throw new Error(`Unknown prompt key '${key}'.`);
 	const clean = String(prompt).trim();
 	if (Buffer.byteLength(clean, "utf8") > MAX_PROMPT_BYTES) throw new Error(`Prompt too large (${Buffer.byteLength(clean, "utf8")} > ${MAX_PROMPT_BYTES} bytes).`);
+	for (const dir of [path.dirname(PROMPT_DIR), PROMPT_DIR]) {
+		try {
+			if (fs.lstatSync(dir).isSymbolicLink()) throw new Error(`Refusing to write through symlink: ${dir}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
 	fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
+	if (fs.lstatSync(PROMPT_DIR).isSymbolicLink()) throw new Error(`Refusing to write through symlink: ${PROMPT_DIR}`);
 	const safe = key.replace(/[^A-Za-z0-9_-]/g, "_");
 	const file = path.join(PROMPT_DIR, `${safe}.yaml`);
 	try {
 		const existing = fs.lstatSync(file);
-		if (existing.isSymbolicLink()) throw new Error(`Refusing to write through symlink: ${file}`);
+		if (existing.isSymbolicLink() || existing.nlink > 1) throw new Error(`Refusing to write through linked file: ${file}`);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	const body = `key: ${key}\ndescription: Editable prompt card for ${key}\nprompt: |\n${clean.split("\n").map((line) => `  ${line}`).join("\n")}\n`;
-	const tmp = `${file}.${process.pid}.tmp`;
-	fs.writeFileSync(tmp, body, { mode: 0o600, flag: "wx" });
-	fs.renameSync(tmp, file);
+	AtomicWriteText(file, body);
 	cache = undefined;
 	cacheStamp = "";
 	return file;

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CAPS, MnemonicStore, parsePath } from "../src/store.ts";
+import { CAPS, MnemonicStore, parsePath, ProjectKey } from "../src/store.ts";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -100,6 +100,139 @@ test("Recall ranks associated techniques by token overlap", () => {
 	assert.match(hits[0].Text, /Xvfb/);
 });
 
+test("Recall filters and boosts by project and concept tags", () => {
+	const { store } = tempStore();
+	store.learn("pi-fleet emits a bounded run event", ["project:pi-fleet", "concept:fleet", "fleet"]);
+	store.learn("v0 dialog surface is unboxed", ["project:twisted-xng", "concept:v0"]);
+	const scoped = store.Recall("bounded run event", 5, { tags: ["project:pi-fleet"] });
+	assert.equal(scoped.length, 1);
+	assert.deepEqual(scoped[0].Matched, ["project:pi-fleet"]);
+	assert.match(scoped[0].Text, /pi-fleet/);
+	const concept = store.Recall("anything", 5, { tags: ["concept:v0"] });
+	assert.equal(concept.length, 1);
+	assert.match(concept[0].Text, /v0/);
+	const any = store.Recall("run dialog", 5, { tags: ["project:pi-fleet", "concept:v0"], mode: "any" });
+	assert.equal(any.length, 2);
+});
+
+test("concurrent store writers merge instead of overwriting each other", () => {
+	const { dir, file } = tempStore();
+	const first = new MnemonicStore(file);
+	const second = new MnemonicStore(file);
+	first.set("alpha", "from-first");
+	second.set("beta", "from-second");
+	first.flush();
+	second.flush();
+	const merged = new MnemonicStore(file);
+	assert.equal(merged.peek("alpha"), "from-first");
+	assert.equal(merged.peek("beta"), "from-second");
+
+	const stale = new MnemonicStore(file);
+	const deleter = new MnemonicStore(file);
+	assert.equal(deleter.delete("alpha"), true);
+	deleter.flush();
+	assert.equal(new MnemonicStore(file).peek("alpha"), undefined);
+	stale.set("gamma", "g");
+	stale.flush();
+	assert.equal(new MnemonicStore(file).peek("alpha"), undefined);
+	assert.equal(fs.existsSync(`${file}.lock`), false);
+	assert.ok(fs.readdirSync(dir).every((name) => !name.endsWith(".tmp")));
+});
+
+test("concurrent nested register writes merge by field, including deletes", () => {
+	const { file } = tempStore();
+	const first = new MnemonicStore(file);
+	first.set("research.one", "1");
+	first.flush();
+	const second = new MnemonicStore(file);
+	second.set("research.two", "2");
+	second.flush();
+	let merged = new MnemonicStore(file);
+	assert.equal(merged.peek("research.one"), "1");
+	assert.equal(merged.peek("research.two"), "2");
+
+	const deleter = new MnemonicStore(file);
+	assert.equal(deleter.delete("research.one"), true);
+	deleter.flush();
+	merged = new MnemonicStore(file);
+	assert.equal(merged.peek("research.one"), undefined);
+	assert.equal(merged.peek("research.two"), "2");
+});
+
+test("reserved segments are rejected inside quoted dotted keys", () => {
+	const { file } = tempStore();
+	const store = new MnemonicStore(file);
+	assert.throws(() => store.set('cfg["__proto__.polluted"]', "PWNED"), /Reserved path segment/);
+	assert.equal(({} as Record<string, unknown>).polluted, undefined);
+});
+
+test("cold restore survives the next merge", () => {
+	const { file } = tempStore();
+	const store = new MnemonicStore(file);
+	const fact = store.learn("stale fact");
+	store.flush();
+	const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+	const old = Date.now() - 30 * 86_400_000;
+	raw.facts[0].createdAt = old;
+	raw.facts[0].lastUsedAt = old;
+	fs.writeFileSync(file, JSON.stringify(raw));
+	const pruner = new MnemonicStore(file);
+	pruner.Prune(null, 10, "test");
+	assert.equal(pruner.ListFacts().length, 0);
+	assert.equal(pruner.Restore(fact.id), true);
+	pruner.flush();
+	assert.equal(new MnemonicStore(file).ListFacts().length, 1);
+});
+
+test("concurrent array elements and quoted dot paths stay distinct", () => {
+	const { file } = tempStore();
+	const first = new MnemonicStore(file);
+	const second = new MnemonicStore(file);
+	first.set("hosts.dev[0].port", 8787);
+	second.set("hosts.dev[1].port", 9999);
+	first.flush();
+	second.flush();
+	const merged = new MnemonicStore(file);
+	assert.equal(merged.peek("hosts.dev[0].port"), 8787);
+	assert.equal(merged.peek("hosts.dev[1].port"), 9999);
+
+	const dotted = new MnemonicStore(file);
+	dotted.set('cfg["a.b"]', "dotted");
+	dotted.flush();
+	dotted.set("cfg.a.b", "nested");
+	dotted.flush();
+	const final = new MnemonicStore(file);
+	assert.equal(final.peek('cfg["a.b"]'), "dotted");
+	assert.equal(final.peek("cfg.a.b"), "nested");
+});
+
+test("simultaneous scalar writes record a bounded conflict", () => {
+	const { file } = tempStore();
+	const first = new MnemonicStore(file);
+	const second = new MnemonicStore(file);
+	first.set("mode", "on");
+	second.set("mode", "off");
+	first.flush();
+	second.flush();
+	const third = new MnemonicStore(file);
+	const fourth = new MnemonicStore(file);
+	third.set("shared.mode", "on");
+	fourth.set("shared.mode", "off");
+	third.flush();
+	fourth.flush();
+	const conflicts = new MnemonicStore(file).listConflicts();
+	assert.ok(conflicts.some((conflict) => conflict.Key === "mode"));
+	assert.ok(conflicts.some((conflict) => conflict.Key.includes("shared") && conflict.Key.includes("mode")));
+	assert.ok(conflicts.at(-1)!.Values.some((value) => value.includes("on")));
+	assert.ok(conflicts.at(-1)!.Values.some((value) => value.includes("off")));
+});
+
+test("ProjectKey derives a stable project tag from a path", () => {
+	assert.equal(ProjectKey("/home/user/projects/pi-fleet/src"), "pi-fleet");
+	assert.equal(ProjectKey("/mnt/data/workspace/twisted-xng/webui"), "twisted-xng");
+	assert.equal(ProjectKey("/home/user/.pi/agent"), "agent");
+});
+
 test("prune moves stale items to bounded cold storage and restores them", () => {
 	const { store, file } = tempStore();
 	store.set("stale_key", "old");
@@ -171,7 +304,7 @@ test("usage rows aggregate and export to observability formats", () => {
 });
 
 test("corrupt store is quarantined and replaced", () => {
-	const { store, file } = tempStore();
+	const { file } = tempStore();
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, "not json");
 	const reloaded = new MnemonicStore(file);

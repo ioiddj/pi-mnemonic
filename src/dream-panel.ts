@@ -1,4 +1,6 @@
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth, type KeyId } from "@earendil-works/pi-tui";
+import type { Keybindings } from "./browser.ts";
 
 export interface DreamConfigView {
 	Enabled: boolean;
@@ -25,7 +27,7 @@ interface Component {
 	dispose?(): void;
 }
 
-function fg(theme: any, token: string, text: string): string {
+function fg(theme: Theme | undefined, token: ThemeColor, text: string): string {
 	return typeof theme?.fg === "function" ? theme.fg(token, text) : text;
 }
 
@@ -33,23 +35,23 @@ function pad(text: string, width: number): string {
 	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
 }
 
-function header(theme: any, title: string, width: number): string {
+function header(theme: Theme | undefined, title: string, width: number): string {
 	const label = ` ${title} `;
 	const rest = Math.max(0, width - 2 - visibleWidth(label));
 	const left = Math.floor(rest / 2);
 	return fg(theme, "border", "╭" + "─".repeat(left)) + fg(theme, "accent", label) + fg(theme, "border", "─".repeat(rest - left) + "╮");
 }
 
-function footer(theme: any, text: string, width: number): string {
+function footer(theme: Theme | undefined, text: string, width: number): string {
 	return fg(theme, "border", "╰" + truncateToWidth(pad(text, Math.max(1, width - 2)), Math.max(1, width - 2)) + "╯");
 }
 
-function row(theme: any, text: string, width: number): string {
+function row(theme: Theme | undefined, text: string, width: number): string {
 	const inner = Math.max(1, width - 2);
 	return fg(theme, "border", "│") + truncateToWidth(pad(text, inner), inner) + fg(theme, "border", "│");
 }
 
-export function BuildDreamPanel(config: DreamConfigView, selected: number, theme: any, width: number): string[] {
+export function BuildDreamPanel(config: DreamConfigView, selected: number, theme: Theme | undefined, width: number): string[] {
 	const w = Math.min(Math.max(56, width), 92);
 	const lines = [
 		header(theme, "idle miner control", w),
@@ -72,8 +74,8 @@ export function BuildDreamPanel(config: DreamConfigView, selected: number, theme
 export function CreateDreamPanel(
 	initial: DreamConfigView,
 	tui: { requestRender(): void },
-	theme: any,
-	keybindings: { matches(data: string, action: string): boolean } | undefined,
+	theme: Theme | undefined,
+	keybindings: Keybindings | undefined,
 	done: (result: DreamPanelResult) => void,
 ): Component {
 	const state = { ...initial, PromptKeys: [...initial.PromptKeys] };
@@ -85,7 +87,7 @@ export function CreateDreamPanel(
 		cachedLines = undefined;
 		tui.requestRender();
 	};
-	const matches = (data: string, semantic: string, fallback: string) => Boolean(keybindings?.matches?.(data, semantic) || matchesKey(data, fallback as any));
+	const matches = (data: string, semantic: string, fallback: KeyId) => Boolean(keybindings?.matches?.(data, semantic) || matchesKey(data, fallback));
 	return {
 		render(width: number): string[] {
 			if (cachedLines && cachedWidth === width) return cachedLines;

@@ -1,29 +1,84 @@
+/**
+ * PiMnemonic extension entry point: bounded memory tools, scoped recall,
+ * markdown interpolation, idle mining, and deterministic meta-cognition.
+ */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { getAgentDir, type ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { AssociateSectionName, BuildAssociateContext, BuildAssociations, BuildContext, BuildLinkHints, ContextSectionName, LinkSectionName, RecallSectionName } from "./src/context.ts";
-import { GenerateCounterfactuals } from "./src/imagine.ts";
+import { AssociateSectionName, BuildAssociateContext, BuildAssociations, BuildContext, BuildLinkHints, ContextSectionName, LinkSectionName, RecallSectionName, ScopeTags } from "./src/context.ts";
+import { GenerateCounterfactuals, type Scenario } from "./src/imagine.ts";
 import { PromptStructured } from "./src/intelligence.ts";
-import { CreateRegisterBrowser } from "./src/browser.ts";
-import { CreateDreamPanel, type DreamConfigView } from "./src/dream-panel.ts";
+import { CreateRegisterBrowser, type Keybindings } from "./src/browser.ts";
+import { CreateDreamPanel, type DreamConfigView, type DreamPanelResult } from "./src/dream-panel.ts";
 import { PromptKeys, PromptSource, PromptText, ResetPromptCard, WritePromptCard } from "./src/prompt-cards.ts";
 import { DEFAULT_PROMPTS } from "./src/prompt-defaults.ts";
-import { DEFAULT_CHARTER_PATTERNS, DEFAULT_PRUNE_PATTERNS, DEFAULT_TRIGGER_PATTERNS } from "./src/tripwire.ts";
+import { DEFAULT_CHARTER_PATTERNS, DEFAULT_PRUNE_PATTERNS } from "./src/tripwire.ts";
 import { AssessRisk, DesignExperiment, Hypothesize, Predict, Quantify, type Evidence } from "./src/meta.ts";
 import { DEFAULT_REFLECT_PATTERNS, DeterministicReflection, EvaluateTriggers, ReflectionToInnerText, ReflectionToText, type ReflectResult } from "./src/reflect.ts";
 import { WarmMarkdownLinks, WeaveRelatedLinks } from "./src/links.ts";
-import { CAPS, MnemonicStore, type Technique } from "./src/store.ts";
+import { CAPS, MnemonicStore, parsePath, ProjectKey, TagSlug } from "./src/store.ts";
 import { redactCommand } from "./src/redact.ts";
+import { AtomicUpdateText, AtomicWriteText, WithFileLock } from "./src/file-lock.ts";
 import { RenderMarkdown, RenderTemplate } from "./src/template.ts";
 
 type AnyRecord = Record<string, unknown>;
+interface RenderRequester { requestRender(): void }
+
+interface DreamContext {
+	readonly signal?: AbortSignal;
+	readonly isIdle?: () => boolean;
+	readonly hasPendingMessages?: () => boolean;
+	readonly sessionManager?: { readonly getSessionFile?: () => string | undefined };
+}
+
+function AsRecord(value: unknown): AnyRecord {
+	return value && typeof value === "object" ? value as AnyRecord : {};
+}
+
+function AsDreamContext(ctx: unknown): DreamContext | undefined {
+	const row = AsRecord(ctx);
+	return {
+		signal: row.signal && typeof row.signal === "object" ? row.signal as AbortSignal : undefined,
+		isIdle: typeof row.isIdle === "function" ? row.isIdle as () => boolean : undefined,
+		hasPendingMessages: typeof row.hasPendingMessages === "function" ? row.hasPendingMessages as () => boolean : undefined,
+		sessionManager: row.sessionManager && typeof row.sessionManager === "object" ? row.sessionManager as DreamContext["sessionManager"] : undefined,
+	};
+}
+
+function ContextPercentOf(ctx: unknown): number | null {
+	const usage = AsRecord(ctx).getContextUsage;
+	if (typeof usage !== "function") return null;
+	const value = AsRecord((usage as () => unknown).call(ctx));
+	return typeof value.percent === "number" ? value.percent : null;
+}
+
+function CwdOf(ctx: unknown): string {
+	const cwd = AsRecord(ctx).cwd;
+	return typeof cwd === "string" ? cwd : "";
+}
+
+function ModelIdOf(ctx: unknown): string {
+	const model = AsRecord(ctx).model;
+	return model && typeof model === "object" ? String(AsRecord(model).id || "") : "";
+}
+
+function TextFromContent(content: unknown, separator = " "): string {
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) => {
+			const row = AsRecord(part);
+			return row.type === "text" && typeof row.text === "string" ? row.text : "";
+		})
+		.filter(Boolean)
+		.join(separator);
+}
 
 const CHARTER_SOURCES = path.join(path.dirname(fileURLToPath(import.meta.url)), ".config", "charter", "SOURCES.md");
 
@@ -32,22 +87,35 @@ function ExportTarget(raw: string): string {
 	const target = path.resolve(raw.replace(/^@/, ""));
 	if (!(target === root || target.startsWith(`${root}${path.sep}`))) throw new MnemonicError("Export path must be inside the pi-mnemonic export directory.", `Use a path under ${root}.`);
 	try {
-		if (fs.existsSync(target) || fs.lstatSync(target).isSymbolicLink()) throw new Error("exists");
+		fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+		const rootReal = fs.realpathSync(root);
+		const parentReal = fs.realpathSync(path.dirname(target));
+		if (!(parentReal === rootReal || parentReal.startsWith(`${rootReal}${path.sep}`))) throw new Error("outside");
+		const stat = fs.lstatSync(target);
+		if (stat.isSymbolicLink() || stat.isFile()) throw new Error("exists");
 	} catch (error) {
 		if (error instanceof MnemonicError) throw error;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return target;
+		throw new MnemonicError("Export path escapes the export directory or already exists.", `Use a fresh path under ${root}.`);
 	}
 	return target;
 }
 
 function WriteExport(file: string, text: string): void {
-	fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-	fs.writeFileSync(file, text, { mode: 0o600, flag: "wx" });
+	WithFileLock(file, () => {
+		if (fs.existsSync(file)) throw new Error(`Export already exists: ${file}`);
+		AtomicWriteText(file, text);
+	});
 }
 
-async function OperatorConfirm(ctx: any, label: string): Promise<boolean> {
-	if (typeof ctx?.ui?.confirm !== "function") return false;
+type ConfirmFn = (title: string, message: string) => Promise<boolean> | boolean;
+
+async function OperatorConfirm(ctx: unknown, label: string): Promise<boolean> {
+	const ui = (ctx as { readonly ui?: { readonly confirm?: unknown } } | undefined)?.ui;
+	const confirm = ui?.confirm;
+	if (typeof confirm !== "function") return false;
 	try {
-		return Boolean(await ctx.ui.confirm(label, "This changes operator-controlled configuration."));
+		return Boolean(await (confirm as ConfirmFn).call(ui, label, "This changes operator-controlled configuration."));
 	} catch {
 		return false;
 	}
@@ -76,8 +144,22 @@ function ErrorResult(error: unknown) {
 	return Result(`Error: ${message}\nHint: ${hint}`, { error: true });
 }
 
-function Execute(handler: (params: any, signal?: AbortSignal, ctx?: any) => Promise<any> | any) {
-	return async (_id: string, params: any, signal: AbortSignal | undefined, _update: unknown, ctx: any) => {
+type ToolResult = ReturnType<typeof Result> & { readonly isError?: boolean };
+
+interface ToolDefinition {
+	readonly name: string;
+	readonly execute: (
+		toolCallId: string,
+		params: AnyRecord,
+		signal: AbortSignal | undefined,
+		onUpdate: unknown,
+		ctx: unknown,
+	) => Promise<ToolResult> | ToolResult;
+	readonly [key: string]: unknown;
+}
+
+function Execute<P extends AnyRecord = AnyRecord>(handler: (params: P, signal?: AbortSignal, ctx?: unknown) => Promise<ToolResult> | ToolResult) {
+	return async (_id: string, params: P, signal: AbortSignal | undefined, _update: unknown, ctx: unknown): Promise<ToolResult> => {
 		try {
 			return await handler(params, signal, ctx);
 		} catch (error) {
@@ -157,14 +239,12 @@ function WriteSkillFile(name: string, summary: string, detail: string, command: 
 		detail || "Follow this technique when the trigger description matches the task.",
 		codeBlock,
 	].join("\n");
-	if (fs.existsSync(skillFile)) {
-		const existing = fs.readFileSync(skillFile, "utf8");
+	AtomicUpdateText(skillFile, (existing) => {
+		if (!existing) return body;
 		const addition = `\n\n## Update ${new Date().toISOString()}\n\n${summary}\n\n${detail}\n`;
 		if (existing.length + addition.length > 100_000) throw new MnemonicError(`Skill ${slug} is too large to append.`, "Edit the SKILL.md manually or choose a new Name.");
-		fs.appendFileSync(skillFile, addition, { mode: 0o600 });
-	} else {
-		fs.writeFileSync(skillFile, body, { mode: 0o600 });
-	}
+		return `${existing}${addition}`;
+	}, "", 100_000);
 	return skillFile;
 }
 
@@ -177,24 +257,25 @@ function AppendAgentRule(key: string, summary: string): string {
 	const file = AgentRulesPath();
 	const clean = summary.replace(/[\r\n]+/g, " ").replace(/[{}]/g, "").replace(/\s+/g, " ").trim().slice(0, 240);
 	const line = `- {{${key}}} — ${clean}`;
-	const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "# Universal agent rules\n";
-	if (existing.includes(line)) return file;
-	if (existing.length + line.length + 4 > 100_000) throw new MnemonicError("Global AGENTS.md is too large to append.", "Edit it manually or choose a narrower rule.");
-	fs.writeFileSync(file, `${existing.trimEnd()}\n${line}\n`, { mode: 0o600 });
+	AtomicUpdateText(file, (existing) => {
+		const text = existing || "# Universal agent rules\n";
+		if (text.includes(line)) return text;
+		if (text.length + line.length + 4 > 100_000) throw new MnemonicError("Global AGENTS.md is too large to append.", "Edit it manually or choose a narrower rule.");
+		return `${text.trimEnd()}\n${line}\n`;
+	}, "", 100_000);
 	return file;
 }
 
 function MessageText(messages: unknown): string {
 	if (!Array.isArray(messages)) return "";
-	const assistant = [...messages].reverse().find((message: any) => message?.role === "assistant" || message?.message?.role === "assistant");
-	const content = assistant?.content ?? assistant?.message?.content;
+	const assistant = [...messages].reverse().find((message) => {
+		const row = AsRecord(message);
+		return row.role === "assistant" || AsRecord(row.message).role === "assistant";
+	});
+	const row = AsRecord(assistant);
+	const content = row.content ?? AsRecord(row.message).content;
 	if (typeof content === "string") return content.slice(0, 1200);
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((part: any) => part?.type === "text")
-		.map((part: any) => String(part.text || ""))
-		.join("\n")
-		.slice(0, 1200);
+	return TextFromContent(content, "\n").slice(0, 1200);
 }
 
 function ShouldPromote(text: string): boolean {
@@ -232,11 +313,14 @@ function HelpText(): string {
 		"PiMnemonicRender { Template, Vars? } — render Handlebars with registers + Vars. Helpers: count, at; built-ins: #each, lookup, if.",
 		"PiTechnique { Action, Name?, Command?, Description?, Usage?, Params?, Cwd?, Tags?, Vars?, TimeoutMs? } — Actions: Add, Get, List, Render, Delete, Hit, Script, Expose, Exec.",
 		"PiMnemonicWarm { Keys? } — bump hit counts and return the current warm context.",
-		"PiMnemonicRecall { Query, Limit? } — associative recall of registers, facts, episodes, and techniques by token overlap plus recency/hits.",
+		"PiMnemonicRecall { Query, Limit?, Tags?, Project?, Concept?, Cwd?, Mode? } — associative recall scoped by project/concept/task tags; defaults to current project, falls back to global when no scoped hit.",
 		"PiMnemonicCodify { Kind, Name, Summary, Detail?, Command?, Tags?, Params?, Expose? } — Kind: Register, Technique, Tool, Skill, AgentRule. AgentRule appends a {{register}} token to global AGENTS.md; AGENTS.md markdown values are interpolated before each run.",
 		"PiMnemonicLink { Action, Path, Depth?, MaxLinks? } — Action Warm caches markdown link hints; Weave adds a Related section linking neighboring docs.",
 		"PiAssociate { Action? } — passive session association (on/off/status). Compares prompts and responses with prior work to surface what worked, failed, and what lesson transfers.",
 		"PiDream { Action?, MaxSessions?, Promote? } — idle knowledge miner. Run/Status/Promote/Config; promotes high-confidence rules to AGENTS.md.",
+		"Fleet mining: pi-fleet emits pi-fleet:run; child CODIFY:/root cause lines become fleet-mined facts. Disable with PiMnemonicSet Key=fleet.mine Value=false.",
+		"Stored memories auto-tag project:<slug> from cwd; default associative context uses project plus salient concept tags first and falls back to global only when nothing scoped matches.",
+		"Concurrent scalar writes to the same register keep the newer value and record both in a bounded conflict list visible via PiMnemonicStats.",
 		"PiImagine { Focus?, Limit? } — speculative counterfactuals: how a session could have gone differently and what is worth remembering.",
 		"PiSimulate { Focus?, Limit? } — rigorous counterfactuals with Hypothesis, Experiment, and Success criteria.",
 		"PiReflect / PiObserve { Action, Focus?, Intelligent? } — conditional metacognition. Actions Run/Status/Config/Enable/Disable; returns Verdict, Guidance, NextAction, InjectedPrompt, risks and stop conditions, then injects that exact prompt into the next turn.",
@@ -254,7 +338,7 @@ function HelpText(): string {
 		"",
 		"Commands: /pi-mnemonic-help, /pi-mnemonic-status, /pi-mnemonic-warm [Key,Key], /pi-mnemonic-registers, /pi-mnemonic-dream, /pi-mnemonic-compat [mode].",
 		"When you notice a reusable trajectory, capability, or new knowledge, call PiMnemonicCodify instead of letting it disappear into the transcript. Prefer Technique/Tool for commands, Skill for multi-step knowledge, and AgentRule for globally important rules.",
-		"AGENTS.md and other markdown context files are interpolated with {{register}} tokens before each run ({{secret:...}} tokens are preserved). Markdown links are warmed into cached hints; PiMnemonicLink Weave links documents to their neighbors. PiDream mines past sessions when memory headroom is available; PiAssociate injects passive session associations; PiImagine/PiSimulate turn outcomes into counterfactual lessons; PiReflect triggers step-back guidance on phrases, turn counts, context pressure, repeated tools, or manual request.",
+		"AGENTS.md and other markdown context files are interpolated with {{register}} tokens before each run ({{secret:...}} tokens are preserved). Use {{hint \"register.key\"}} for a bounded pointer instead of the whole value. Markdown links to local files/directories/canonical docs and URLs are warmed into cached hints; PiMnemonicLink Weave links documents to their neighbors. PiDream mines past sessions when memory headroom is available; PiAssociate injects passive session associations; PiImagine/PiSimulate turn outcomes into counterfactual lessons; PiReflect triggers step-back guidance on phrases, turn counts, context pressure, repeated tools, or manual request.",
 		`Caps: ${CAPS.registers} registers, ${CAPS.registerBytes} register bytes, ${CAPS.valueBytes} per value, ${CAPS.facts} facts, ${CAPS.episodes} episodes, ${CAPS.techniques} techniques, ${CAPS.dynamicTools} generated tools.`,
 		"Techniques with Expose become PiTechnique<Name> tools with one string parameter per declared Param.",
 		"Security: never store secrets in registers. Use credential_set / {{secret:NAME}} for credentials.",
@@ -300,7 +384,10 @@ async function RunCommand(command: string, cwd: string | undefined, timeoutMs: n
 			cleanup();
 			action();
 		};
-		const killGroup = (_reason: "timeout" | "abort") => {
+		let killed = false;
+		const killGroupNow = () => {
+			if (killed) return;
+			killed = true;
 			if (isWindows) {
 				try { child.kill(); } catch { /* already gone */ }
 			} else {
@@ -310,6 +397,9 @@ async function RunCommand(command: string, cwd: string | undefined, timeoutMs: n
 					try { child.kill("SIGKILL"); } catch { /* already gone */ }
 				}
 			}
+		};
+		const killGroup = (_reason: "timeout" | "abort") => {
+			killGroupNow();
 			child.stdout.destroy();
 			child.stderr.destroy();
 			finish(() => _reason === "abort"
@@ -321,8 +411,12 @@ async function RunCommand(command: string, cwd: string | undefined, timeoutMs: n
 		timer = setTimeout(() => killGroup("timeout"), timeoutMs);
 		onAbort = () => killGroup("abort");
 		signal?.addEventListener("abort", onAbort, { once: true });
-		child.once("error", (error) => finish(() => reject(error)));
+		child.once("error", (error) => finish(() => {
+			killGroupNow();
+			reject(error);
+		}));
 		child.once("close", (code) => finish(() => {
+			killGroupNow();
 			if (signal?.aborted) reject(new DOMException("Aborted", "AbortError"));
 			else resolve({ code, stdout, stderr, truncated, command });
 		}));
@@ -348,22 +442,6 @@ const ScenarioStructuredSchema = Type.Object({
 		Experiment: Type.Optional(Type.String()),
 		Success: Type.Optional(Type.String()),
 	})),
-});
-
-const AssociateStructuredSchema = Type.Object({
-	Relevance: Type.Number(),
-	WhatWorked: Type.String(),
-	WhatFailed: Type.String(),
-	Trajectory: Type.String(),
-	Outcome: Type.String(),
-	Lesson: Type.String(),
-	ShouldUse: Type.Boolean(),
-});
-
-const DreamStructuredSchema = Type.Object({
-	Facts: Type.Array(Type.String()),
-	Skills: Type.Array(Type.Object({ Name: Type.String(), Summary: Type.String() })),
-	Promote: Type.Array(Type.String()),
 });
 
 const PredictionStructuredSchema = Type.Object({
@@ -394,32 +472,12 @@ const ExperimentStructuredSchema = Type.Object({
 	TechniqueName: Type.Optional(Type.String()), Observation: Type.Optional(Type.String()),
 });
 
-const ReflectStructuredSchema = Type.Object({
-	Verdict: StringEnum(["Continue", "Scope", "Reset", "Plan", "Exit"] as const),
-	Useful: Type.Boolean(),
-	Rational: Type.Boolean(),
-	Aligned: Type.Boolean(),
-	Novelty: StringEnum(["low", "medium", "high"] as const),
-	Risks: Type.Array(Type.String()),
-	Guidance: Type.String(),
-	NextAction: Type.String(),
-	InjectedPrompt: Type.String(),
-	StopConditions: Type.Array(Type.String()),
-	Evidence: Type.Array(Type.String()),
-	Confidence: Type.Number(),
-});
-
-const PlanStructuredSchema = Type.Object({
-	RevisedGoal: Type.String(),
-	Steps: Type.Array(Type.String()),
-	Risks: Type.Array(Type.String()),
-	NextActions: Type.Array(Type.String()),
-});
-
 const BACKGROUND_MIN_AVAILABLE_BYTES = 2 * 1024 ** 3;
 const BACKGROUND_MAX_SESSIONS = 10;
-const BACKGROUND_SESSION_BYTES = 512 * 1024;
 const BACKGROUND_MAX_FACTS = 20;
+const FLEET_RUN_EVENT = "pi-fleet:run";
+const FLEET_MAX_CHILDREN = 12;
+const FLEET_MAX_FACTS = 12;
 
 function HasHeadroom(): boolean {
 	try {
@@ -460,17 +518,35 @@ function SessionFiles(limit: number): string[] {
 	return files.sort((a, b) => b.mtime - a.mtime).slice(0, limit).map((entry) => entry.file);
 }
 
+function KnowledgeFromText(text: string, limit = BACKGROUND_MAX_FACTS): { facts: string[]; skills: Array<{ name: string; summary: string }> } {
+	const facts: string[] = [];
+	const skills: Array<{ name: string; summary: string }> = [];
+	const pattern = /^\s*(?:[-*]\s*)?(?:root cause|cause|fix|verified|verdict|conclusion|learned|finding|result|decision|note|shortcut|hint)\b[:-]?\s*(.+)$/i;
+	for (const line of text.split(/\r?\n/)) {
+		const skill = /^\s*SKILL:\s*([a-z0-9_-]+)\s*\|\s*(.+)$/.exec(line);
+		if (skill && skills.length < 4) skills.push({ name: skill[1], summary: skill[2].trim().slice(0, 240) });
+		const codify = /^\s*CODIFY:\s*(.+)$/.exec(line);
+		if (codify && facts.length < limit) {
+			const claim = `Codify: ${codify[1].replace(/\s+/g, " ").trim().slice(0, 240)}`;
+			if (!facts.includes(claim)) facts.push(claim);
+		}
+		const match = pattern.exec(line);
+		if (match && facts.length < limit) {
+			const claim = match[1].replace(/\s+/g, " ").trim().slice(0, 240);
+			if (claim.length > 20 && !facts.includes(claim)) facts.push(claim);
+		}
+	}
+	return { facts, skills };
+}
+
 function ExtractSessionKnowledge(file: string, sweepKb = 512): { facts: string[]; episode?: string; skills: Array<{ name: string; summary: string }> } {
 	const fd = fs.openSync(file, "r");
 	const sweepBytes = Math.max(16_384, Math.min(4_194_304, sweepKb * 1024));
-		const size = Math.min(sweepBytes, fs.statSync(file).size);
+	const size = Math.min(sweepBytes, fs.statSync(file).size);
 	const buffer = Buffer.alloc(size);
 	const read = fs.readSync(fd, buffer, 0, size, 0);
 	fs.closeSync(fd);
-	const facts: string[] = [];
-	const skills: Array<{ name: string; summary: string }> = [];
-	let episode: string | undefined;
-	const pattern = /^\s*(?:[-*]\s*)?(?:root cause|cause|fix|verified|verdict|conclusion|learned|finding|result|decision|note|shortcut|hint)\b[:\-]?\s*(.+)$/i;
+	const texts: string[] = [];
 	for (const line of buffer.slice(0, read).toString("utf8").split(/\r?\n/)) {
 		let text = line;
 		try {
@@ -479,26 +555,15 @@ function ExtractSessionKnowledge(file: string, sweepKb = 512): { facts: string[]
 			if (!message || (message.role !== "user" && message.role !== "assistant")) continue;
 			const content = message.content;
 			if (typeof content === "string") text = content;
-			else if (Array.isArray(content)) text = content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text || "")).join(" ");
+			else if (Array.isArray(content)) text = TextFromContent(content);
 			else continue;
 		} catch {
 			continue;
 		}
-		if (!episode && text.trim()) episode = text.trim().split(/\n/)[0].slice(0, 180);
-		const skill = /^\s*SKILL:\s*([a-z0-9_-]+)\s*\|\s*(.+)$/.exec(text);
-		if (skill && skills.length < 4) skills.push({ name: skill[1], summary: skill[2].trim().slice(0, 240) });
-		const codify = /^\s*CODIFY:\s*(.+)$/.exec(text);
-		if (codify && facts.length < BACKGROUND_MAX_FACTS) {
-			const claim = `Codify: ${codify[1].replace(/\s+/g, " ").trim().slice(0, 240)}`;
-			if (!facts.includes(claim)) facts.push(claim);
-		}
-		const match = pattern.exec(text);
-		if (match && facts.length < BACKGROUND_MAX_FACTS) {
-			const claim = match[1].replace(/\s+/g, " ").trim().slice(0, 240);
-			if (claim.length > 20 && !facts.includes(claim)) facts.push(claim);
-		}
+		if (text.trim()) texts.push(text.trim());
 	}
-	return { facts, episode, skills };
+	const knowledge = KnowledgeFromText(texts.join("\n"));
+	return { facts: knowledge.facts, episode: texts[0]?.split(/\n/)[0].slice(0, 180), skills: knowledge.skills };
 }
 
 export default function PiMnemonic(pi: ExtensionAPI) {
@@ -508,7 +573,6 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	let dreamTimer: ReturnType<typeof setTimeout> | undefined;
 	let transientPrompt = "";
 	let transientResponse = "";
-	let transientAt = 0;
 	const registeredToolNames = new Set<string>();
 	const toolStartArgs = new Map<string, unknown>();
 	const generatedTools = new Map<string, string>();
@@ -516,6 +580,10 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	const GetStore = (): MnemonicStore => {
 		if (!store) store = new MnemonicStore();
 		return store;
+	};
+	const WithProjectTags = (tags: string[] | undefined, cwd: unknown): string[] => {
+		const project = ProjectKey(cwd);
+		return [...new Set([...(tags || []), ...(project ? [`project:${project}`, project] : [])])].slice(0, 20);
 	};
 	const Flush = () => {
 		try {
@@ -559,21 +627,23 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		});
 		Flush();
 	};
-	const RegisterTool = (definition: AnyRecord) => {
-		registeredToolNames.add(String(definition.name));
+	const RegisterTool = (definition: ToolDefinition) => {
+		registeredToolNames.add(definition.name);
+		const base = definition as unknown as Parameters<typeof pi.registerTool>[0];
+		const execute = async (toolCallId: string, params: AnyRecord, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown): Promise<ToolResult> => {
+			const started = Date.now();
+			try {
+				const result = await definition.execute(toolCallId, params, signal, onUpdate, ctx);
+				RecordToolUsage(definition.name, params, started, result, undefined, ModelIdOf(ctx));
+				return result;
+			} catch (error) {
+				RecordToolUsage(definition.name, params, started, undefined, error, ModelIdOf(ctx));
+				throw error;
+			}
+		};
 		pi.registerTool({
-			...(definition as any),
-			execute: async (toolCallId: string, params: AnyRecord, signal: AbortSignal | undefined, onUpdate: unknown, ctx: any) => {
-				const started = Date.now();
-				try {
-					const result = await (definition as any).execute(toolCallId, params, signal, onUpdate, ctx);
-					RecordToolUsage(String(definition.name), params, started, result, undefined, String(ctx?.model?.id || ""));
-					return result;
-				} catch (error) {
-					RecordToolUsage(String(definition.name), params, started, undefined, error, String(ctx?.model?.id || ""));
-					throw error;
-				}
-			},
+			...base,
+			execute: execute as Parameters<typeof pi.registerTool>[0]["execute"],
 		});
 	};
 
@@ -581,7 +651,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	const ReconcileTechniqueTools = () => {
 		const current = GetStore();
 		const desired = new Set(current.allTechniques().filter((technique) => technique.expose).slice(0, CAPS.dynamicTools).map((technique) => technique.id));
-		for (const [id, name] of [...generatedTools.entries()]) {
+		for (const [id, name] of generatedTools.entries()) {
 			if (desired.has(id)) continue;
 			generatedTools.delete(id);
 			try {
@@ -632,6 +702,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		for (const technique of current.allTechniques().filter((r) => r.expose).slice(0, CAPS.dynamicTools)) {
 			const existing = generatedTools.get(technique.id);
 			if (existing) continue;
+			if (generatedTools.size >= CAPS.dynamicTools) continue;
 			let toolName = `PiTechnique${ToPascal(technique.name)}`;
 			const taken = (name: string) => [...generatedTools.values()].includes(name) || (pi.getAllTools?.() || []).some((tool: AnyRecord) => tool.name === name);
 			if (taken(toolName)) toolName = `${toolName}${createHash("sha1").update(technique.id).digest("hex").slice(0, 6).toUpperCase()}`;
@@ -659,7 +730,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}
 	};
 
-	const DreamRun = async (ctx: any, promote = false, force = false, aborted = false, promoteApproved = false, skillApproved = false) => {
+	const DreamRun = async (ctx: DreamContext | undefined, promote = false, force = false, aborted = false, promoteApproved = false, skillApproved = false) => {
 		if (shuttingDown || aborted || ctx?.signal?.aborted) return { processed: 0, promoted: [] as string[], skipped: true };
 		if (dreamingActive) return { processed: 0, promoted: [] as string[], skipped: true };
 		if (!HasHeadroom() || (!force && (ctx?.isIdle?.() === false || ctx?.hasPendingMessages?.()))) return { processed: 0, promoted: [] as string[], skipped: true };
@@ -676,8 +747,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			: BACKGROUND_MAX_SESSIONS;
 		for (const file of SessionFiles(sessionLimit)) {
 			if (shuttingDown || aborted || ctx?.signal?.aborted) break;
-			const sm = ctx?.sessionManager as AnyRecord | undefined;
-			const liveFile = String(sm && typeof sm.getSessionFile === "function" ? (sm.getSessionFile as () => string)() : (process.env.PI_SESSION_FILE || ""));
+			const liveFile = String(ctx?.sessionManager?.getSessionFile?.() || process.env.PI_SESSION_FILE || "");
 			if (file === liveFile || set.has(file)) continue;
 			if (!HasHeadroom()) break;
 			try {
@@ -705,6 +775,41 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}
 	};
 
+	const MineFleetRun = (payload: unknown) => {
+		if (shuttingDown || !payload || typeof payload !== "object") return;
+		const current = GetStore();
+		if (["off", "engram-primary"].includes(CompatMode())) return;
+		if (current.peek("fleet.mine") === false) return;
+		const data = payload as AnyRecord;
+		const children = Array.isArray(data.children) ? data.children.slice(0, FLEET_MAX_CHILDREN) : [];
+		if (!children.length) return;
+		let learned = 0;
+		let done = 0;
+		const summaries: string[] = [];
+		for (const row of children) {
+			const child = row as AnyRecord | undefined;
+			if (!child || typeof child !== "object") continue;
+			const id = String(child.id || "").slice(0, 64);
+			const role = String(child.role || "worker").slice(0, 24);
+			const status = String(child.status || "completed").slice(0, 16);
+			if (status === "completed") done += 1;
+			const task = String(child.task || "").replace(/\s+/g, " ").trim().slice(0, 120);
+			const output = String(child.output || "").slice(0, 16_384);
+			const error = String(child.error || "").slice(0, 2048);
+			const knowledge = KnowledgeFromText(`${output}\n${error}`, FLEET_MAX_FACTS);
+			for (const claim of knowledge.facts.slice(0, FLEET_MAX_FACTS)) {
+				current.learn(claim, ["fleet-mined", `fleet-${role}`], 0.65, `pi-fleet/${id || "unknown"}`);
+				learned += 1;
+			}
+			summaries.push(`${role} ${id} ${status}${task ? ` — ${task}` : ""}`.slice(0, 240));
+		}
+		const traceId = String(data.traceId || "unknown").slice(0, 64);
+		const depth = Number(data.depth) || 0;
+		current.note(`Fleet ${traceId.slice(0, 8)} d${depth}: ${done}/${children.length} tasks`, summaries.join("\n").slice(0, 4096), ["fleet-mined"]);
+		current.set("fleet.lastRun", { at: Date.now(), traceId, children: children.length, learned }, ["fleet"]);
+		Flush();
+	};
+
 	RegisterTool({
 		name: "PiMnemonicHelp",
 		label: "Pi Mnemonic Help",
@@ -723,11 +828,12 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Value: Type.String({ description: "JSON or plain-text value" }),
 			Tags: Type.Optional(Type.Array(Type.String())),
 		}),
-		execute: Execute((params: AnyRecord) => {
+		execute: Execute((params: AnyRecord, _signal, ctx) => {
 			const key = String(params.Key);
+			const normalizedKey = parsePath(key).map(String).join(".");
 			const reserved = ["charter.", "dream.", "prune.auto", "reflect.", "associate.", "meta.", "background.", "observability.enabled", "memory.compatMode"];
-			if (reserved.some((prefix) => key.startsWith(prefix))) throw new MnemonicError(`Key '${key}' is operator-controlled.`, "Use the corresponding operator tool instead.");
-			GetStore().set(key, ParseValue(String(params.Value), "Value"), (params.Tags as string[]) || []);
+			if (reserved.some((prefix) => normalizedKey === prefix || normalizedKey.startsWith(prefix))) throw new MnemonicError(`Key '${key}' is operator-controlled.`, "Use the corresponding operator tool instead.");
+			GetStore().set(key, ParseValue(String(params.Value), "Value"), WithProjectTags(params.Tags as string[] | undefined, CwdOf(ctx)));
 			Flush();
 			return Result(`Stored ${key}`, { key });
 		}),
@@ -787,8 +893,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Confidence: Type.Optional(Type.Number()),
 			Source: Type.Optional(Type.String()),
 		}),
-		execute: Execute((params: AnyRecord) => {
-			const fact = GetStore().learn(String(params.Claim), (params.Tags as string[]) || [], Number(params.Confidence ?? 0.8), String(params.Source || "agent"));
+		execute: Execute((params: AnyRecord, _signal, ctx) => {
+			const fact = GetStore().learn(String(params.Claim), WithProjectTags(params.Tags as string[] | undefined, CwdOf(ctx)), Number(params.Confidence ?? 0.8), String(params.Source || "agent"));
 			Flush();
 			return Result(`Learned ${fact.id}: ${fact.claim}`, { id: fact.id });
 		}),
@@ -804,8 +910,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Detail: Type.Optional(Type.String()),
 			Tags: Type.Optional(Type.Array(Type.String())),
 		}),
-		execute: Execute((params: AnyRecord) => {
-			const episode = GetStore().note(String(params.Summary), String(params.Detail || ""), (params.Tags as string[]) || []);
+		execute: Execute((params: AnyRecord, _signal, ctx) => {
+			const episode = GetStore().note(String(params.Summary), String(params.Detail || ""), WithProjectTags(params.Tags as string[] | undefined, CwdOf(ctx)));
 			Flush();
 			return Result(`Noted ${episode.id}: ${episode.summary}`, { id: episode.id });
 		}),
@@ -931,15 +1037,24 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	RegisterTool({
 		name: "PiMnemonicRecall",
 		label: "Pi Mnemonic Recall",
-		description: "Associative recall of registers, facts, episodes, and techniques using token overlap, exact-phrase boost, hits, and recency. No embedding DB.",
-		promptSnippet: "Recall a technique or prior finding by association instead of searching the transcript",
+		description: "Associative recall scoped by project/concept tags. Query by task salience, a project, concept:, task: or kind: tag; omit filters for global recall. No embedding DB.",
+		promptSnippet: "Recall knowledge scoped to a project, concept, task or prior experience",
 		parameters: Type.Object({
 			Query: Type.String({ description: "Natural-language query or keywords" }),
 			Limit: Type.Optional(Type.Number({ description: "Max hits (1-20), default 8" })),
+			Tags: Type.Optional(Type.Array(Type.String({ description: "Tag filters such as project:pi-fleet, concept:memory or task:review" }))),
+			Project: Type.Optional(Type.String({ description: "Project name/path shorthand for a project: tag" })),
+			Concept: Type.Optional(Type.String({ description: "Concept tag shorthand" })),
+			Cwd: Type.Optional(Type.String({ description: "Derive the current project tag from this path (defaults to session cwd)" })),
+			Mode: Type.Optional(StringEnum(["all", "any"] as const, { description: "Match all requested tags (default) or any tag" })),
 		}),
-		execute: Execute((params: AnyRecord) => {
-			const hits = GetStore().Recall(String(params.Query), Number(params.Limit || 8));
-			return Result(hits.length ? JSON.stringify(hits, null, 2) : "No associated memory found. Try PiMnemonicList or rephrase the query.", { hits });
+		execute: Execute((params: AnyRecord, _signal, ctx) => {
+			const current = GetStore();
+			const tags = [...((params.Tags as string[]) || []), ...(params.Project ? [`project:${TagSlug(params.Project)}`] : []), ...(params.Concept ? [`concept:${TagSlug(params.Concept)}`] : [])];
+			if (!tags.length && params.Cwd !== undefined) tags.push(...ScopeTags(current, String(params.Cwd), String(params.Query)));
+			if (!tags.length && CwdOf(ctx)) tags.push(`project:${ProjectKey(CwdOf(ctx))}`);
+			const hits = current.Recall(String(params.Query), Number(params.Limit || 8), { tags, mode: params.Mode === "any" ? "any" : "all" });
+			return Result(hits.length ? JSON.stringify(hits, null, 2) : "No associated memory found. Try broader Tags/Mode or PiMnemonicList.", { hits, tags });
 		}),
 	});
 
@@ -959,13 +1074,17 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Params: Type.Optional(Type.Array(Type.String())),
 			Expose: Type.Optional(Type.Boolean()),
 		}),
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const current = GetStore();
 			const kind = String(params.Kind);
 			const name = String(params.Name || "").trim();
 			const summary = String(params.Summary || "").trim();
 			if (!name || !summary) throw new MnemonicError("Codify requires Name and Summary.", "Example: { Kind:'Technique', Name:'safe-xvfb', Summary:'Use xvfb-run with GLX disabled', Command:'...' }");
-			const tags = [...new Set([...((params.Tags as string[]) || []), "technique", kind.toLowerCase()])];
+			const tags = [...new Set([...((params.Tags as string[]) || []), ...WithProjectTags(undefined, CwdOf(ctx)), "technique", kind.toLowerCase()])];
+			if ((kind === "Technique" || kind === "Tool") && !params.Command) throw new MnemonicError("Technique/Tool requires Command.", "Provide a deterministic shell command with {{mustache}} parameters.");
+			if (kind === "AgentRule" || kind === "Skill") {
+				if (!(await OperatorConfirm(ctx, `Allow writing persistent ${kind} memory?`))) throw new MnemonicError("Operator confirmation required.", "Global memory writes are operator-controlled.");
+			}
 			current.learn(summary, tags, 0.9, "PiMnemonicCodify");
 			current.note(`Codified ${kind}: ${name}`, summary, tags);
 			if (kind === "Register") {
@@ -974,23 +1093,19 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				return Result(`Stored register ${name}. Recall it with PiMnemonicRecall.`, { kind, name });
 			}
 			if (kind === "Technique" || kind === "Tool") {
-				if (!params.Command) throw new MnemonicError("Technique/Tool requires Command.", "Provide a deterministic shell command with {{mustache}} parameters.");
 				const technique = current.techniqueAdd({
 					name: SkillName(name).replace(/-/g, "_"),
 					command: String(params.Command),
 					description: summary,
 					usage: String(params.Detail || `Call PiTechnique Exec ${name} with Vars.`),
 					params: (params.Params as string[]) || [],
-					cwd: ctx?.cwd,
+					cwd: CwdOf(ctx),
 					tags,
 					expose: kind === "Tool" || params.Expose === true,
 				});
 				Flush();
 				if (technique.expose) RegisterTechniqueTools();
 				return Result(`Codified ${kind} ${technique.name}. ${technique.expose ? `Generated tool PiTechnique${ToPascal(technique.name)}.` : "Call Expose later to generate a tool."}`, { kind, name: technique.name });
-			}
-			if (kind === "AgentRule" || kind === "Skill") {
-				if (!(await OperatorConfirm(ctx, `Allow writing persistent ${kind} memory?`))) throw new MnemonicError("Operator confirmation required.", "Global memory writes are operator-controlled.");
 			}
 			if (kind === "AgentRule") {
 				const key = `rule.${SkillName(name).replace(/-/g, "_")}`;
@@ -1017,26 +1132,26 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Depth: Type.Optional(Type.Number({ description: "Local markdown link depth, 0-3 (default 1)" })),
 			MaxLinks: Type.Optional(Type.Number({ description: "Max Related links to weave (default 10)" })),
 		}),
-		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const rawPath = String(params.Path || "").replace(/^@/, "");
 			const file = path.resolve(rawPath);
 			if (!fs.existsSync(file) || !fs.statSync(file).isFile()) throw new MnemonicError(`Markdown file not found: ${file}`, "Pass an existing local markdown file path.");
 			if (!/\.md$/i.test(file)) throw new MnemonicError("PiMnemonicLink requires a .md file.", "Point Path at a markdown document.");
 			if (String(params.Action) === "Weave") {
 				if (!(await OperatorConfirm(ctx, "Allow appending a Related section to this markdown file?"))) throw new MnemonicError("Operator confirmation required.", "Weave mutates the target file.");
-				const result = WeaveRelatedLinks(file, Number(params.MaxLinks || 10), ctx?.cwd);
+				const result = WeaveRelatedLinks(file, Number(params.MaxLinks || 10), CwdOf(ctx));
 				Flush();
 				return Result(`Woven ${result.added.length} links into ${result.file}.`, result);
 			}
 			const text = fs.readFileSync(file, "utf8").slice(0, 200_000);
-			const links = WarmMarkdownLinks(GetStore(), text, file, Number(params.Depth ?? 1), ctx?.cwd);
+			const links = WarmMarkdownLinks(GetStore(), text, file, Number(params.Depth ?? 1), [CwdOf(ctx), getAgentDir()]);
 			Flush();
 			return Result(links.length ? JSON.stringify(links, null, 2) : "No markdown links found.", { links });
 		}),
 	});
 
 	const EvidenceFromStore = (focus: string, limit = 8): Evidence[] => GetStore().Recall(focus, limit) as Evidence[];
-	const MetaStructured = async (ctx: any, system: string, prompt: string, fallback: Record<string, unknown>, schema: any, _requiredKey: string, signal?: AbortSignal, enabled = true) => {
+	const MetaStructured = async (ctx: unknown, system: string, prompt: string, fallback: Record<string, unknown>, schema: TSchema, _requiredKey: string, signal?: AbortSignal, enabled = true) => {
 		if (!enabled) return fallback;
 		const structured = await PromptStructured(ctx, system, prompt, 900, signal);
 		if (!structured) return fallback;
@@ -1066,9 +1181,9 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		};
 	};
 
-	const RunReflection = async (ctx: any, focus: string, intelligent = true, reasons: string[] = [], manual = false, signal?: AbortSignal) => {
+	const RunReflection = async (ctx: unknown, focus: string, intelligent = true, reasons: string[] = [], manual = false, signal?: AbortSignal) => {
 		const current = GetStore();
-		const deterministic = DeterministicReflection({ Focus: focus, Reasons: reasons, LastResponse: String(transientResponse || ""), ContextPercent: ctx?.getContextUsage?.()?.percent ?? null, ToolRepeats: Number(current.peek("reflect.toolRepeats") ?? 0) });
+		const deterministic = DeterministicReflection({ Focus: focus, Reasons: reasons, LastResponse: String(transientResponse || ""), ContextPercent: ContextPercentOf(ctx), ToolRepeats: Number(current.peek("reflect.toolRepeats") ?? 0) });
 		let result: ReflectResult = deterministic;
 		if (intelligent) {
 			const structured = await PromptStructured(
@@ -1113,7 +1228,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Query: Type.Optional(Type.String()),
 			Intelligent: Type.Optional(Type.Boolean()),
 		}),
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const action = String(params.Action || "Status");
 			const current = GetStore();
 			if (action === "On" || action === "Off") {
@@ -1165,7 +1280,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			SweepKb: Type.Optional(Type.Number()),
 			Intelligent: Type.Optional(Type.Boolean()),
 		}),
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const action = String(params.Action || "Status");
 			const current = GetStore();
 			if (params.MaxSessions !== undefined) {
@@ -1175,7 +1290,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			if (action === "Run") {
 				const promoteApproved = params.Promote === true ? await OperatorConfirm(ctx, "Allow promoting rules to global AGENTS.md?") : false;
 				const skillApproved = params.Skill === true ? await OperatorConfirm(ctx, "Allow writing mined skills?") : false;
-				const result = await DreamRun(ctx, params.Promote === true, true, false, promoteApproved, skillApproved);
+				const result = await DreamRun(AsDreamContext(ctx), params.Promote === true, true, false, promoteApproved, skillApproved);
 				let distilled: Record<string, unknown> | undefined;
 				if (params.Intelligent !== false) {
 					const candidates = current.Recall("root cause verified fix failure environment operator trajectory", 12);
@@ -1189,7 +1304,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 						for (const fact of Array.isArray(distilled.Facts) ? distilled.Facts.slice(0, 12) : []) {
 							if (typeof fact === "string" && fact.trim()) current.learn(fact, ["dream", "distilled"], 0.75, "PiDream");
 						}
-						for (const skill of Array.isArray(distilled.Skills) ? distilled.Skills.slice(0, 4) : []) {
+						if (skillApproved) for (const skill of Array.isArray(distilled.Skills) ? distilled.Skills.slice(0, 4) : []) {
 							if (skill && typeof skill.Name === "string" && typeof skill.Summary === "string") {
 								WriteSkillFile(skill.Name, skill.Summary, "Distilled by PiDream.", undefined, ["dream"]);
 							}
@@ -1201,6 +1316,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				return Result(JSON.stringify(payload, null, 2), payload, distilled || result);
 			}
 			if (action === "Promote") {
+				if (!(await OperatorConfirm(ctx, "Allow promoting rules to global AGENTS.md?"))) throw new MnemonicError("Operator confirmation required.", "Promotion writes to global AGENTS.md.");
 				const promoted = PromoteFacts(current, 3);
 				Flush();
 				return Result(promoted.length ? `Promoted ${promoted.join(", ")}` : "No high-confidence facts were promoted.", { promoted });
@@ -1231,7 +1347,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Tags: Type.Optional(Type.Array(Type.String())),
 			Intelligent: Type.Optional(Type.Boolean()),
 		}),
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const goal = String(params.Goal || "").trim();
 			if (!goal) throw new MnemonicError("PiPlan requires Goal.", "Example: { Goal:'Migrate launcher tests to private Xvfb', Steps:['...'] }");
 			const current = GetStore();
@@ -1264,11 +1380,11 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Intelligent: Type.Optional(Type.Boolean()),
 		}),
 		outputSchema: ScenarioStructuredSchema,
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 			const current = GetStore();
 			const focus = String(params.Focus || transientPrompt || "failure crash timeout stale guess");
 			const deterministic = GenerateCounterfactuals(current, focus, Number(params.Limit || 4), false);
-			let scenarios: any[] = deterministic;
+			let scenarios: Scenario[] = deterministic;
 			if (params.Intelligent !== false) {
 				const structured = await PromptStructured(
 					ctx,
@@ -1278,12 +1394,15 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 					signal,
 				);
 				if (Array.isArray(structured?.Scenarios) && structured.Scenarios.length) {
-					scenarios = structured.Scenarios.slice(0, 8).map((entry: any) => ({
-						Source: String(entry.Source || "PiImagine"),
-						Trigger: String(entry.Trigger || focus),
-						Counterfactual: String(entry.Counterfactual || ""),
-						Lesson: String(entry.Lesson || ""),
-					}));
+					scenarios = (structured.Scenarios as unknown[]).slice(0, 8).map((entry) => {
+						const row = AsRecord(entry);
+						return {
+							Source: String(row.Source || "PiImagine"),
+							Trigger: String(row.Trigger || focus),
+							Counterfactual: String(row.Counterfactual || ""),
+							Lesson: String(row.Lesson || ""),
+						};
+					});
 				}
 			}
 			for (const scenario of scenarios) {
@@ -1306,11 +1425,11 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Intelligent: Type.Optional(Type.Boolean()),
 		}),
 		outputSchema: ScenarioStructuredSchema,
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 			const current = GetStore();
 			const focus = String(params.Focus || transientPrompt || "failure crash timeout stale guess");
 			const deterministic = GenerateCounterfactuals(current, focus, Number(params.Limit || 4), true);
-			let scenarios: any[] = deterministic;
+			let scenarios: Scenario[] = deterministic;
 			if (params.Intelligent !== false) {
 				const structured = await PromptStructured(
 					ctx,
@@ -1320,15 +1439,18 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 					signal,
 				);
 				if (Array.isArray(structured?.Scenarios) && structured.Scenarios.length) {
-					scenarios = structured.Scenarios.slice(0, 8).map((entry: any) => ({
-						Source: String(entry.Source || "PiSimulate"),
-						Trigger: String(entry.Trigger || focus),
-						Counterfactual: String(entry.Counterfactual || ""),
-						Lesson: String(entry.Lesson || ""),
-						Hypothesis: String(entry.Hypothesis || ""),
-						Experiment: String(entry.Experiment || ""),
-						Success: String(entry.Success || ""),
-					}));
+					scenarios = (structured.Scenarios as unknown[]).slice(0, 8).map((entry) => {
+						const row = AsRecord(entry);
+						return {
+							Source: String(row.Source || "PiSimulate"),
+							Trigger: String(row.Trigger || focus),
+							Counterfactual: String(row.Counterfactual || ""),
+							Lesson: String(row.Lesson || ""),
+							Hypothesis: String(row.Hypothesis || ""),
+							Experiment: String(row.Experiment || ""),
+							Success: String(row.Success || ""),
+						};
+					});
 				}
 			}
 			for (const scenario of scenarios) {
@@ -1353,7 +1475,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		promptSnippet: "Predict the likely outcome of the current trajectory from past evidence",
 		parameters: Type.Object({ Focus: Type.Optional(Type.String()), Horizon: Type.Optional(Type.Number()), Intelligent: Type.Optional(Type.Boolean()) }),
 		outputSchema: PredictionStructuredSchema,
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 			const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current trajectory");
 			const evidence = EvidenceFromStore(focus);
 			const fallback = Predict(focus, evidence) as unknown as Record<string, unknown>;
@@ -1363,10 +1485,10 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	const RiskExecute = Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+	const RiskExecute = Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 		const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current trajectory");
 		const evidence = EvidenceFromStore(focus);
-		const fallback = AssessRisk(focus, evidence, ctx?.getContextUsage?.()?.percent ?? null, Number(GetStore().peek("reflect.toolRepeats") ?? 0)) as unknown as Record<string, unknown>;
+		const fallback = AssessRisk(focus, evidence, ContextPercentOf(ctx), Number(GetStore().peek("reflect.toolRepeats") ?? 0)) as unknown as Record<string, unknown>;
 		const result = await MetaStructured(ctx, PromptText("PiRiskAssessment"), `Focus: ${focus}\nEvidence: ${JSON.stringify(evidence)}`, fallback, RiskStructuredSchema, "Recommendation", signal, params.Intelligent !== false);
 		MetaRemember(`Risk assessment: ${String(result.Recommendation).slice(0, 160)}`, JSON.stringify(result).slice(0, 4000), ["risk", "meta"]);
 		return Result(JSON.stringify(result, null, 2), result, result);
@@ -1390,10 +1512,10 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: RiskExecute,
 	});
 
-	const QuantExecute = Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+	const QuantExecute = Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 		const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current trajectory");
 		const evidence = EvidenceFromStore(focus);
-		const fallback = Quantify(focus, evidence, ctx?.getContextUsage?.()?.percent ?? null, Number(GetStore().peek("reflect.toolRepeats") ?? 0)) as unknown as Record<string, unknown>;
+		const fallback = Quantify(focus, evidence, ContextPercentOf(ctx), Number(GetStore().peek("reflect.toolRepeats") ?? 0)) as unknown as Record<string, unknown>;
 		const result = await MetaStructured(ctx, PromptText("PiQuantify"), `Focus: ${focus}\nMetric: ${String(params.Metric || "")}\nEvidence: ${JSON.stringify(evidence)}`, fallback, QuantStructuredSchema, "Formula", signal, params.Intelligent !== false);
 		MetaRemember(`Quant model: ${focus}`, JSON.stringify(result).slice(0, 4000), ["model", "meta"]);
 		return Result(JSON.stringify(result, null, 2), result, result);
@@ -1423,7 +1545,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		description: "Turn an assumption into a falsifiable hypothesis with metrics, success criterion, falsifier, and cost.",
 		parameters: Type.Object({ Focus: Type.Optional(Type.String()), Claim: Type.Optional(Type.String()), Intelligent: Type.Optional(Type.Boolean()) }),
 		outputSchema: HypothesisStructuredSchema,
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 			const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current assumption");
 			const evidence = EvidenceFromStore(focus);
 			const fallback = Hypothesize(focus, evidence) as unknown as Record<string, unknown>;
@@ -1443,7 +1565,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Vars: Type.Optional(Type.String()), Run: Type.Optional(Type.Boolean()), Intelligent: Type.Optional(Type.Boolean()),
 		}),
 		outputSchema: ExperimentStructuredSchema,
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 			const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current assumption");
 			const hypothesis = String(params.Hypothesis || GetStore().peek("reflect.lastGuidance") || `Changing ${focus} may improve the outcome.`);
 			const fallback = DesignExperiment(focus, hypothesis, String(params.TechniqueName || "")) as unknown as Record<string, unknown>;
@@ -1473,7 +1595,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		Patterns: Type.Optional(Type.Array(Type.String())),
 	});
 
-	const ReflectExecute = Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+	const ReflectExecute = Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 		const action = String(params.Action || "Status");
 		const current = GetStore();
 		if (action === "Enable" || action === "Disable") {
@@ -1539,7 +1661,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Mode: Type.Optional(StringEnum(["always", "trigger", "periodic", "off"] as const)),
 			EveryNTurns: Type.Optional(Type.Number()),
 		}),
-		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const action = String(params.Action || "Show");
 			if ((action === "Enable" || action === "Disable" || action === "Config") && !(await OperatorConfirm(ctx, "Allow changing the operating charter?"))) {
 				throw new MnemonicError("Operator confirmation required.", "This is an operator-controlled safety setting.");
@@ -1608,7 +1730,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Auto: Type.Optional(Type.Boolean()),
 			Decision: Type.Optional(StringEnum(["Fire", "Skip", "Defer"] as const)),
 		}),
-		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: unknown) => {
 			const action = String(params.Action || "Status");
 			const current = GetStore();
 			const config = PruneConfig();
@@ -1641,7 +1763,6 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			let decisions: Record<string, "Prune" | "Keep"> | null = null;
 			if (params.Intelligent !== false && candidates.length) {
 				const decision = await PromptStructured(ctx, PromptText("PiTriggerDecision"), JSON.stringify({ Focus: focus, Reasons: trigger.Reasons, CandidateCount: candidates.length }), 300, signal);
-				const decisionFire = decision ? (decision.Fire === true || decision.Priority === "Fire") : true;
 				if ((decision && decision.Fire === false) || decision?.Priority === "Skip" || decision?.Priority === "Defer") return Result(JSON.stringify({ skipped: true, reason: (decision as AnyRecord | undefined)?.Reason || "Decision model Skip" }, null, 2));
 				const structured = await PromptStructured(ctx, PromptText("PiPruneDecision"), JSON.stringify({ Focus: focus, Candidates: candidates.slice(0, 20) }), 600, signal);
 				if (!Array.isArray(structured?.Decisions)) return Result(JSON.stringify({ skipped: true, reason: "Prune decision model returned no valid Decisions; nothing was moved." }, null, 2), { error: true, skipped: true });
@@ -1671,7 +1792,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Key: Type.Optional(Type.String()),
 			Prompt: Type.Optional(Type.String()),
 		}),
-		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const action = String(params.Action || "List");
 			if (action === "List") {
 				return Result(JSON.stringify(PromptKeys().map((key) => ({ Key: key, Source: PromptSource(key) })), null, 2));
@@ -1698,7 +1819,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Action: StringEnum(["Status", "Set"] as const),
 			Mode: Type.Optional(StringEnum(["coexist", "mnemonic-primary", "engram-primary", "off"] as const)),
 		}),
-		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			if (String(params.Action) === "Set") {
 				if (!params.Mode) throw new MnemonicError("Set requires Mode.", "Use coexist, mnemonic-primary, engram-primary, or off.");
 				if (!(await OperatorConfirm(ctx, "Allow changing memory coexistence mode?"))) throw new MnemonicError("Operator confirmation required.", "This affects both memory extensions.");
@@ -1720,7 +1841,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Limit: Type.Optional(Type.Number()),
 			SinceMs: Type.Optional(Type.Number()),
 		}),
-		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: any) => {
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: unknown) => {
 			const action = String(params.Action || "Dump");
 			const current = GetStore();
 			if (action === "Enable" || action === "Disable") {
@@ -1763,6 +1884,14 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		description: "Show store counts, file path, and caps.",
 		parameters: Type.Object({}),
 		execute: Execute(() => Result(JSON.stringify(GetStore().stats(), null, 2))),
+	});
+
+	pi.events.on(FLEET_RUN_EVENT, (data: unknown) => {
+		try {
+			MineFleetRun(data);
+		} catch {
+			// Fleet mining is best-effort and must never break delegation.
+		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1811,15 +1940,17 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			: typeof customContent === "string"
 				? customContent
 				: Array.isArray(customContent)
-					? customContent.filter((part: any) => part?.type === "text").map((part: any) => String(part.text || "")).join("\n")
+					? TextFromContent(customContent, "\n")
 					: "";
-		event.systemPromptOptions.sections[RecallSectionName()] = BuildAssociations(current, promptText, 1200);
+		const scopeCwd = String(event.systemPromptOptions.cwd || ctx.cwd || "");
+		event.systemPromptOptions.sections[RecallSectionName()] = BuildAssociations(current, promptText, 1200, scopeCwd);
 		if (current.peek("associate.enabled") !== false) {
-			transientPrompt = promptText.slice(0, 1200); transientAt = Date.now();
+			transientPrompt = promptText.slice(0, 1200);
 			const lastResponse = String(transientResponse || "");
-			const association = BuildAssociateContext(current, promptText, lastResponse);
+			const association = BuildAssociateContext(current, promptText, lastResponse, 2200, scopeCwd);
 			const cold = current.ColdRecall(promptText, 5, Number(current.peek("associate.promoteThreshold") ?? 5));
-			event.systemPromptOptions.sections[AssociateSectionName()] = [association, cold.Promoted.length ? `Promoted from cold storage after repeated association: ${cold.Promoted.join(", ")}.` : ""].filter(Boolean).join("\n");
+			const promoted = cold.Promoted.slice(0, 5).map((key) => String(key).slice(0, 120)).join(", ").slice(0, 300);
+			event.systemPromptOptions.sections[AssociateSectionName()] = [association, promoted ? `Promoted from cold storage after repeated association: ${promoted}.` : ""].filter(Boolean).join("\n");
 		} else {
 			event.systemPromptOptions.sections[AssociateSectionName()] = "";
 		}
@@ -1836,12 +1967,12 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			if (!reflection) {
 				const trigger = EvaluateTriggers({
 					Focus: promptText,
-					LastResponse: String(transientResponse || transientResponse || ""),
+					LastResponse: String(transientResponse || ""),
 					Patterns: reflectConfig.Patterns,
 					EveryNTurns: reflectConfig.EveryNTurns,
 					Turns: Number(current.peek("reflect.turns") ?? 0),
 					TurnsSince: Number(current.peek("reflect.turnsSinceReflect") ?? 0),
-					ContextPercent: ctx?.getContextUsage?.()?.percent ?? null,
+					ContextPercent: ContextPercentOf(ctx),
 					ContextThreshold: reflectConfig.ContextThreshold,
 					ToolRepeats: Number(current.peek("reflect.toolRepeats") ?? 0),
 					ToolRepeatThreshold: reflectConfig.ToolRepeatThreshold,
@@ -1856,7 +1987,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				Flush();
 			}
 		}
-		const contextPercent = ctx?.getContextUsage?.()?.percent ?? null;
+		const contextPercent = ContextPercentOf(ctx);
 		const repeats = Number(current.peek("reflect.toolRepeats") ?? 0);
 		const metaTrigger = EvaluateTriggers({
 			Focus: promptText,
@@ -1937,9 +2068,13 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}
 		for (const file of event.systemPromptOptions.contextFiles) {
 			if (!/\.md$/i.test(file.path) || file.content.length > 200_000) continue;
-			const rendered = RenderMarkdown(ApplyPinTokens(file.content, String(event.systemPromptOptions.cwd || ctx.cwd)), StoreVariables());
-			if (rendered !== file.content) file.content = rendered;
-			WarmMarkdownLinks(current, rendered, file.path, 1, String(event.systemPromptOptions.cwd || ctx.cwd));
+			try {
+				const rendered = RenderMarkdown(ApplyPinTokens(file.content, String(event.systemPromptOptions.cwd || ctx.cwd)), StoreVariables());
+				if (rendered !== file.content) file.content = rendered;
+				WarmMarkdownLinks(current, rendered, file.path, 1, [String(event.systemPromptOptions.cwd || ctx.cwd), getAgentDir()]);
+			} catch {
+				// A malformed template must not break the turn; leave the original markdown intact.
+			}
 		}
 		event.systemPromptOptions.sections[LinkSectionName()] = BuildLinkHints(current);
 		current.pathHit(event.systemPromptOptions.cwd || ctx.cwd);
@@ -1999,8 +2134,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	pi.on("agent_end", async (event) => {
 		const current = GetStore();
 		const response = MessageText((event as unknown as AnyRecord).messages);
-		transientResponse = response || ""; transientAt = Date.now();
-		if (current.peek("associate.enabled") !== false && response) transientResponse = response; transientAt = Date.now();
+		transientResponse = response || "";
+		if (current.peek("associate.enabled") !== false && response) transientResponse = response;
 		Flush();
 	});
 
@@ -2040,7 +2175,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		const idleMs = Math.max(1000, Number(current.peek("dream.idleMs") ?? 15_000));
 		dreamTimer = setTimeout(async () => {
 			dreamTimer = undefined;
-			await DreamRun(ctx, current.peek("dream.autoPromote") === true, false, false, current.peek("dream.autoPromote") === true, current.peek("dream.autoSkill") === true);
+			await DreamRun(AsDreamContext(ctx), current.peek("dream.autoPromote") === true, false, false, current.peek("dream.autoPromote") === true, current.peek("dream.autoSkill") === true);
 		}, idleMs);
 		dreamTimer.unref?.();
 	});
@@ -2058,8 +2193,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				ctx.ui.notify("/pi-mnemonic-dream needs an interactive Pi session", "error");
 				return;
 			}
-			const result = await ctx.ui.custom<any>(
-				(tui: any, theme: any, keybindings: any, done: (value: any) => void) => CreateDreamPanel(DreamConfigView(), tui, theme, keybindings, done) as any,
+			const result = await ctx.ui.custom<DreamPanelResult>(
+				(tui: unknown, theme: unknown, keybindings: unknown, done: (value: DreamPanelResult) => void) => CreateDreamPanel(DreamConfigView(), tui as RenderRequester, theme as Theme, keybindings as Keybindings | undefined, done),
 				{ overlay: true, overlayOptions: { anchor: "center", width: 76, maxHeight: 20 }, blocked: { kind: "question", message: "Idle miner control" } },
 			);
 			if (!result?.Save) return;
@@ -2090,7 +2225,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				return;
 			}
 			await ctx.ui.custom<void>(
-				(tui: any, theme: any, keybindings: any, done: () => void) => CreateRegisterBrowser(GetStore(), ConflictInfo(), tui, theme, keybindings, done) as any,
+				(tui: unknown, theme: unknown, keybindings: unknown, done: () => void) => CreateRegisterBrowser(GetStore(), ConflictInfo(), tui as RenderRequester, theme as Theme, keybindings as Keybindings | undefined, done),
 				{
 					overlay: true,
 					overlayOptions: { anchor: "center", width: 78, maxHeight: 22 },

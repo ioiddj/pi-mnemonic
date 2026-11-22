@@ -8,7 +8,7 @@ export type DecoratorDelegate = (
 ) => HelperDelegate;
 
 export const registerInlineDecorator = (register: (name: string, fn: DecoratorDelegate) => void): void => {
-   register('inline', (fn, props, container, options) => {
+   register('inline', (fn, props, _container, options) => {
       const partials = (props.partials as Record<string, unknown> | undefined) ?? {};
       props.partials = partials;
       const partialName = options.args[0];

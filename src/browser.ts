@@ -1,4 +1,5 @@
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth, type KeyId } from "@earendil-works/pi-tui";
 import type { MnemonicStore } from "./store.ts";
 
 export interface ConflictInfo {
@@ -13,19 +14,19 @@ interface Component {
 	dispose?(): void;
 }
 
-interface Keybindings {
-	matches(data: string, action: string): boolean;
+export interface Keybindings {
+	readonly matches: (data: string, action: string) => boolean;
 }
 
 const VIEWS = ["Registers", "Facts", "Episodes", "Techniques", "Cold", "Usage"] as const;
 type View = (typeof VIEWS)[number];
 const VIEWPORT = 16;
 
-function fg(theme: any, token: string, text: string): string {
+function fg(theme: Theme | undefined, token: ThemeColor, text: string): string {
 	return typeof theme?.fg === "function" ? theme.fg(token, text) : text;
 }
 
-function dim(theme: any, text: string): string {
+function dim(theme: Theme | undefined, text: string): string {
 	return fg(theme, "dim", text);
 }
 
@@ -33,7 +34,7 @@ function pad(text: string, width: number): string {
 	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
 }
 
-function header(theme: any, title: string, width: number): string {
+function header(theme: Theme | undefined, title: string, width: number): string {
 	const label = ` ${title} `;
 	const rest = Math.max(0, width - 2 - visibleWidth(label));
 	const left = Math.floor(rest / 2);
@@ -41,17 +42,17 @@ function header(theme: any, title: string, width: number): string {
 	return fg(theme, "border", "╭" + "─".repeat(left)) + fg(theme, "accent", label) + fg(theme, "border", "─".repeat(right) + "╮");
 }
 
-function footer(theme: any, text: string, width: number): string {
+function footer(theme: Theme | undefined, text: string, width: number): string {
 	const inner = Math.max(1, width - 2);
 	return fg(theme, "border", "╰" + truncateToWidth(pad(text, inner), inner) + "╯");
 }
 
-function row(theme: any, text: string, width: number): string {
+function row(theme: Theme | undefined, text: string, width: number): string {
 	const inner = Math.max(1, width - 2);
 	return fg(theme, "border", "│") + truncateToWidth(pad(text, inner), inner) + fg(theme, "border", "│");
 }
 
-function viewRows(store: MnemonicStore, view: View, theme: any): string[] {
+function viewRows(store: MnemonicStore, view: View, theme: Theme | undefined): string[] {
 	if (view === "Registers") {
 		const rows = store.list("", false).slice(0, 200);
 		return [fg(theme, "muted", "KEY".padEnd(28) + "HITS   BYTES  PREVIEW"), ...rows.map((r) => `${pad(String(r.key), 28)} ${String(r.hits).padStart(4)} ${String(r.bytes).padStart(7)}  ${String(r.preview)}`)];
@@ -81,11 +82,10 @@ export function BuildRegisterPanel(
 	conflict: ConflictInfo,
 	view: View,
 	width: number,
-	theme?: any,
+	theme?: Theme,
 	scrollOffset = 0,
 ): string[] {
 	const boxWidth = Math.min(Math.max(48, width), 100);
-	const inner = Math.max(1, boxWidth - 2);
 	const rows = viewRows(store, view, theme);
 	const maxScroll = Math.max(0, rows.length - VIEWPORT);
 	const offset = Math.max(0, Math.min(scrollOffset, maxScroll));
@@ -108,7 +108,7 @@ export function CreateRegisterBrowser(
 	store: MnemonicStore,
 	conflict: ConflictInfo,
 	tui: { requestRender(): void },
-	theme: any,
+	theme: Theme | undefined,
 	keybindings: Keybindings | undefined,
 	done: () => void,
 ): Component {
@@ -122,8 +122,8 @@ export function CreateRegisterBrowser(
 		store.flush();
 		tui.requestRender();
 	};
-	const matches = (data: string, semantic: string, fallback: string) => Boolean(
-		keybindings?.matches?.(data, semantic) || matchesKey(data, fallback as any),
+	const matches = (data: string, semantic: string, fallback: KeyId) => Boolean(
+		keybindings?.matches?.(data, semantic) || matchesKey(data, fallback),
 	);
 	return {
 		render(width: number): string[] {

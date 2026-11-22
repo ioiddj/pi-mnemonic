@@ -7,6 +7,11 @@ test("SafePatternHits ignores pathological regexes", () => {
 	assert.deepEqual(hits, ["Pattern stuck", "Pattern loop"]);
 });
 
+test("SafePatternHits rejects nested bounded quantifiers and scans past 2KB", () => {
+	assert.deepEqual(SafePatternHits(`${"a".repeat(2000)}b`, ["(a+){10}"]), []);
+	assert.ok(SafePatternHits(`${"x".repeat(2500)} prune now`, ["prune"]).length === 1);
+});
+
 test("KeywordHits matches lowercase keywords", () => {
 	assert.deepEqual(KeywordHits("Too much NOISE here", ["noise", "stale"]), ["noise"]);
 });

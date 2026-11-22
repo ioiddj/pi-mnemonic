@@ -1,8 +1,13 @@
+/**
+ * Bounded mnemonic store: locked atomic persistence, per-field merge,
+ * associative recall, pruning/cold storage, and usage accounting.
+ */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { redactCommand } from "./redact.ts";
+import { AtomicWriteText, FileStamp, WithFileLock } from "./file-lock.ts";
 
 export interface PinMeta {
 	pinned?: boolean;
@@ -32,8 +37,19 @@ export const CAPS = {
 	cold: 200,
 	coldBytes: 1024 * 1024,
 	usage: 2000,
+	tombstones: 256,
 	hotItems: 5,
 } as const;
+
+export function TagSlug(value: unknown): string {
+	return String(value ?? "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+}
+
+export function ProjectKey(cwd: unknown): string {
+	const parts = String(cwd || "").replace(/\\/g, "/").split("/").filter(Boolean);
+	const marker = parts.findIndex((part) => ["projects", "workspace", "repositories", "repos"].includes(part.toLowerCase()));
+	return TagSlug(marker >= 0 ? parts[marker + 1] : parts.at(-1));
+}
 
 export interface RegisterMeta extends PinMeta {
 	value: unknown;
@@ -41,6 +57,8 @@ export interface RegisterMeta extends PinMeta {
 	hits: number;
 	createdAt: number;
 	lastUsedAt: number;
+	fieldTimes?: Record<string, number>;
+	fieldRemoved?: Record<string, boolean>;
 }
 
 export interface Fact extends PinMeta {
@@ -85,6 +103,18 @@ export interface RecallHit {
 	Text: string;
 	Score: number;
 	Tags: string[];
+	Matched?: string[];
+}
+
+export interface RecallOptions {
+	readonly tags?: readonly string[];
+	readonly mode?: "all" | "any";
+}
+
+export interface MergeConflict {
+	readonly Key: string;
+	readonly At: number;
+	readonly Values: readonly string[];
 }
 
 export interface Counted extends PinMeta {
@@ -118,6 +148,8 @@ export interface MnemonicState {
 	paths: Counted[];
 	commands: Counted[];
 	usage: UsageEvent[];
+	tombstones: Record<string, number>;
+	conflicts: MergeConflict[];
 }
 
 type Scored = { hits: number; createdAt?: number; lastUsedAt?: number; lastSeenAt?: number };
@@ -132,6 +164,8 @@ const DEFAULT_STATE = (): MnemonicState => ({
 	paths: [],
 	commands: [],
 	usage: [],
+	tombstones: {},
+	conflicts: [],
 });
 
 export function resolveStatePath(): string {
@@ -155,7 +189,171 @@ function trim<T extends Scored>(items: T[], cap: number): T[] {
 	return [...items].sort((a, b) => score(b) - score(a)).slice(0, cap);
 }
 
+const INTERNAL_CONFLICT_PREFIXES = ["reflect.", "prune.", "charter.", "associate.", "background.", "dream.", "meta.", "observability."];
+
+function PushConflict(conflicts: MergeConflict[], conflict: MergeConflict): void {
+	if (INTERNAL_CONFLICT_PREFIXES.some((prefix) => conflict.Key.startsWith(prefix))) return;
+	const signature = `${conflict.Key}|${[...conflict.Values].sort().join("|")}`;
+	if (conflicts.some((entry) => `${entry.Key}|${[...entry.Values].sort().join("|")}` === signature)) return;
+	conflicts.push(conflict);
+}
+
+interface Stamped {
+	readonly lastUsedAt?: number;
+	readonly lastSeenAt?: number;
+	readonly createdAt?: number;
+	readonly At?: number;
+	readonly hits?: number;
+}
+
+function stampOf(value: unknown): number {
+	const stamped = (value && typeof value === "object" ? value : {}) as Stamped;
+	return Number(stamped.lastUsedAt ?? stamped.lastSeenAt ?? stamped.createdAt ?? stamped.At ?? 0) || 0;
+}
+
+/** Merge a local writer's changes into the on-disk state under the store lock. */
+const FIELD_CAP = 128;
+const LEAF_CAP = 256;
+
+function fieldKey(tokens: Array<string | number>): string {
+	return JSON.stringify(tokens);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function capFieldTimes(times: Record<string, number> | undefined): Record<string, number> | undefined {
+	if (!times) return undefined;
+	return Object.fromEntries(Object.entries(times).sort((a, b) => b[1] - a[1]).slice(0, FIELD_CAP));
+}
+
+interface RegisterLeaf { value: unknown; time: number; removed: boolean }
+
+function FlattenRegister(meta: RegisterMeta, prefix: Array<string | number> = [], inherited = 0, out = new Map<string, RegisterLeaf>()): Map<string, RegisterLeaf> | undefined {
+	const value = prefix.length ? getAt(meta.value, prefix) : meta.value;
+	const path = fieldKey(prefix);
+	const time = meta.fieldTimes?.[path] ?? inherited;
+	const entries: Array<[string | number, unknown]> = Array.isArray(value)
+		? Array.from(value.entries())
+		: isPlainObject(value) ? Object.entries(value) : [];
+	if (entries.length) {
+		for (let index = 0; index < entries.length; index++) {
+			const key = entries[index][0];
+			if (typeof key === "string" && RESERVED.has(key)) continue;
+			if (out.size >= LEAF_CAP) return undefined;
+			FlattenRegister(meta, [...prefix, key], time, out);
+		}
+		return out;
+	}
+	out.set(path, { value, time, removed: Boolean(meta.fieldRemoved?.[path]) });
+	return out;
+}
+
+function MergeRegisterValue(key: string, local: RegisterMeta, disk: RegisterMeta, conflicts: MergeConflict[]): unknown {
+	if (!isPlainObject(local.value) || !isPlainObject(disk.value)) return stampOf(local) >= stampOf(disk) ? local.value : disk.value;
+	const ours = FlattenRegister(local);
+	const theirs = FlattenRegister(disk);
+	if (!ours || !theirs) return stampOf(local) >= stampOf(disk) ? local.value : disk.value;
+	for (const path of new Set([...ours.keys(), ...theirs.keys()])) {
+		const a = ours.get(path);
+		const b = theirs.get(path);
+		if (!a || !b) continue;
+		const av = JSON.stringify(a.value ?? null);
+		const bv = JSON.stringify(b.value ?? null);
+		if (av !== bv && a.time && b.time && Math.abs(a.time - b.time) <= 30_000) PushConflict(conflicts, { Key: `${key}${path === "[]" ? "" : `.${path}`}`, At: Date.now(), Values: [bv.slice(0, 200), av.slice(0, 200)] });
+	}
+	let result: unknown = {};
+	for (const path of new Set([...ours.keys(), ...theirs.keys()])) {
+		const a = ours.get(path);
+		const b = theirs.get(path);
+		const aTime = a?.time ?? (local.fieldRemoved?.[path] ? local.fieldTimes?.[path] ?? 0 : 0);
+		const bTime = b?.time ?? (disk.fieldRemoved?.[path] ? disk.fieldTimes?.[path] ?? 0 : 0);
+		const useLocal = aTime >= bTime;
+		const chosen = useLocal ? a : b;
+		const removed = useLocal ? Boolean(local.fieldRemoved?.[path] || a?.removed) : Boolean(disk.fieldRemoved?.[path] || b?.removed);
+		if (!chosen || removed) continue;
+		result = setAt(result, JSON.parse(path) as Array<string | number>, chosen.value);
+	}
+	return result;
+}
+
+function MergeRegisterMeta(key: string, local: RegisterMeta, disk: RegisterMeta, conflicts: MergeConflict[]): RegisterMeta {
+	if (!isPlainObject(local.value) && !isPlainObject(disk.value)) {
+		const ours = JSON.stringify(local.value ?? null);
+		const theirs = JSON.stringify(disk.value ?? null);
+		const a = Number(local.fieldTimes?.["$"] ?? 0);
+		const b = Number(disk.fieldTimes?.["$"] ?? 0);
+		if (ours !== theirs && a && b && Math.abs(a - b) <= 30_000) PushConflict(conflicts, { Key: key, At: Date.now(), Values: [theirs.slice(0, 200), ours.slice(0, 200)] });
+	}
+	const fieldTimes = capFieldTimes({ ...disk.fieldTimes, ...local.fieldTimes });
+	const fieldRemoved = Object.fromEntries(Object.entries({ ...disk.fieldRemoved, ...local.fieldRemoved }).slice(-FIELD_CAP));
+	const value = MergeRegisterValue(key, local, disk, conflicts);
+	const bytes = Buffer.byteLength(JSON.stringify(value ?? null) ?? "null", "utf8");
+	const safeValue = bytes > CAPS.valueBytes ? (stampOf(local) >= stampOf(disk) ? local.value : disk.value) : value;
+	return {
+		...disk,
+		...local,
+		value: safeValue,
+		tags: [...new Set([...(disk.tags || []), ...(local.tags || [])])].slice(-20),
+		hits: Math.max(disk.hits || 0, local.hits || 0),
+		createdAt: Math.min(disk.createdAt || Date.now(), local.createdAt || Date.now()),
+		lastUsedAt: Math.max(disk.lastUsedAt || 0, local.lastUsedAt || 0),
+		fieldTimes,
+		fieldRemoved: Object.keys(fieldRemoved).length ? fieldRemoved : undefined,
+	};
+}
+
+function MergeStates(local: MnemonicState, disk: MnemonicState, removed: Set<string>, resurrected: Set<string>, conflicts: MergeConflict[]): MnemonicState {
+	const rawTombstones: Record<string, number> = { ...disk.tombstones, ...local.tombstones };
+	for (const key of removed) rawTombstones[key] = Date.now();
+	for (const key of resurrected) delete rawTombstones[key];
+	const cutoff = Date.now() - 30 * 86_400_000;
+	const tombstones = Object.fromEntries(Object.entries(rawTombstones).filter(([, at]) => at > cutoff).sort((a, b) => b[1] - a[1]).slice(0, CAPS.tombstones));
+	const isDead = (key: string, item: unknown) => (tombstones[key] || 0) >= stampOf(item);
+	const registers: Record<string, RegisterMeta> = {};
+	for (const [key, meta] of Object.entries(disk.registers)) if (!isDead(key, meta)) registers[key] = meta;
+	for (const [key, meta] of Object.entries(local.registers)) {
+		if (isDead(key, meta)) continue;
+		registers[key] = registers[key] ? MergeRegisterMeta(key, meta, registers[key], conflicts) : meta;
+	}
+	const merge = <T>(ours: readonly T[], theirs: readonly T[], keyOf: (item: T) => string): T[] => {
+		const merged = new Map<string, T>();
+		for (const item of [...theirs, ...ours]) {
+			const key = keyOf(item);
+			if (!key || isDead(key, item)) continue;
+			const prev = merged.get(key);
+			if (!prev || stampOf(item) >= stampOf(prev)) merged.set(key, item);
+		}
+		return [...merged.values()];
+	};
+	const usage = new Map<string, UsageEvent>();
+	for (const item of [...(disk.usage || []), ...(local.usage || [])]) if (item?.Id) usage.set(item.Id, item);
+	return {
+		...local,
+		registers,
+		facts: merge(local.facts, disk.facts, (f) => f?.claim?.trim().toLowerCase() || f?.id),
+		episodes: merge(local.episodes, disk.episodes, (e) => e?.summary?.trim().toLowerCase() || e?.id),
+		techniques: merge(local.techniques, disk.techniques, (t) => t?.name),
+		paths: merge(local.paths, disk.paths, (p) => p?.key),
+		commands: merge(local.commands, disk.commands, (c) => c?.key),
+		usage: [...usage.values()].sort((a, b) => a.At - b.At).slice(-CAPS.usage),
+		tombstones,
+		conflicts: [...new Map([...(disk.conflicts || []), ...(local.conflicts || []), ...conflicts].map((entry) => [`${entry.Key}|${[...entry.Values].sort().join("|")}`, entry])).values()].slice(-20),
+	};
+}
+
+function MergeCold(disk: ColdItem[], local: ColdItem[]): ColdItem[] {
+	const merged = new Map<string, ColdItem>();
+	for (const item of [...disk, ...local]) if (item?.Id) merged.set(item.Id, item);
+	return [...merged.values()].sort((a, b) => a.At - b.At);
+}
+
 const RESERVED = new Set(["__proto__", "prototype", "constructor"]);
+
+function checkSegment(segment: string): void {
+	if (segment.split(".").some((part) => RESERVED.has(part))) throw new Error(`Reserved path segment '${segment}'.`);
+}
 
 export function parsePath(key: string): Array<string | number> {
 	const tokens: Array<string | number> = [];
@@ -167,10 +365,10 @@ export function parsePath(key: string): Array<string | number> {
 			if (!Number.isSafeInteger(index) || index < 0 || index > 1024) throw new Error("Array index must be 0-1024.");
 			tokens.push(index);
 		} else if (match[2] !== undefined) {
-			if (RESERVED.has(match[2])) throw new Error(`Reserved path segment '${match[2]}'.`);
+			checkSegment(match[2]);
 			tokens.push(match[2]);
 		} else {
-			if (RESERVED.has(match[0])) throw new Error(`Reserved path segment '${match[0]}'.`);
+			checkSegment(match[0]);
 			tokens.push(match[0]);
 		}
 	}
@@ -194,29 +392,28 @@ function getAt(root: unknown, tokens: Array<string | number>): unknown {
 function setAt(root: unknown, tokens: Array<string | number>, value: unknown): unknown {
 	if (tokens.length === 0) return value;
 	const result = root ?? (typeof tokens[0] === "number" ? [] : {});
-	let container: any = result;
+	let container: unknown = result;
 	for (let i = 0; i < tokens.length - 1; i++) {
 		const token = tokens[i];
 		const next = tokens[i + 1];
 		const wantArray = typeof token === "number" || typeof next === "number";
+		const child = typeof next === "number" ? [] : {};
 		if (typeof token === "number") {
 			if (!Array.isArray(container)) container = [];
-			if (container[token] === undefined || container[token] === null) {
-				container[token] = typeof next === "number" ? [] : {};
-			}
-			container = container[token];
+			const array = container as unknown[];
+			if (array[token] === undefined || array[token] === null) array[token] = child;
+			container = array[token];
 		} else {
 			if (container === null || typeof container !== "object" || Array.isArray(container)) container = {};
-			if (container[token] === undefined || container[token] === null || wantArray !== Array.isArray(container[token])) {
-				container[token] = typeof next === "number" ? [] : {};
-			}
-			container = container[token];
+			const object = container as Record<string, unknown>;
+			if (object[token] === undefined || object[token] === null || wantArray !== Array.isArray(object[token])) object[token] = child;
+			container = object[token];
 		}
 	}
 	const last = tokens[tokens.length - 1];
 	if (typeof last === "number") {
 		if (!Array.isArray(container)) return result;
-		container[last] = value;
+		(container as unknown[])[last] = value;
 	} else if (container && typeof container === "object") {
 		(container as Record<string, unknown>)[last] = value;
 	}
@@ -291,11 +488,20 @@ export class MnemonicStore {
 	readonly coldFile: string;
 	private state: MnemonicState;
 	private dirty = false;
+	private removed = new Set<string>();
+	private resurrected = new Set<string>();
 
 	constructor(filePath = resolveStatePath()) {
 		this.filePath = filePath;
 		this.coldFile = filePath.replace(/\.json$/, ".cold.json");
 		this.state = this.load();
+	}
+
+	private markTombstone(key: string, at = Date.now()): void {
+		this.state.tombstones ??= {};
+		this.state.tombstones[key] = at;
+		const cutoff = at - 30 * 86_400_000;
+		this.state.tombstones = Object.fromEntries(Object.entries(this.state.tombstones).filter(([, stamp]) => stamp > cutoff).sort((a, b) => b[1] - a[1]).slice(0, CAPS.tombstones));
 	}
 
 	private load(): MnemonicState {
@@ -314,6 +520,8 @@ export class MnemonicStore {
 				paths: Array.isArray(parsed.paths) ? parsed.paths : [],
 				commands: Array.isArray(parsed.commands) ? parsed.commands : [],
 				usage: Array.isArray(parsed.usage) ? (parsed.usage as UsageEvent[]).slice(-CAPS.usage) : [],
+				tombstones: parsed.tombstones && typeof parsed.tombstones === "object" ? parsed.tombstones : {},
+				conflicts: Array.isArray(parsed.conflicts) ? (parsed.conflicts as MergeConflict[]).slice(-20) : [],
 			};
 		} catch {
 			try {
@@ -327,12 +535,22 @@ export class MnemonicStore {
 
 	flush(): void {
 		if (!this.dirty) return;
-		this.state.updatedAt = Date.now();
-		this.pruneAll();
-		fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
-		const tmp = `${this.filePath}.${process.pid}.tmp`;
-		fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
-		fs.renameSync(tmp, this.filePath);
+		WithFileLock(this.filePath, () => {
+			for (let attempt = 0; attempt < 3; attempt++) {
+				const conflicts: MergeConflict[] = [];
+				const before = FileStamp(this.filePath);
+				const disk = this.load();
+				this.state = MergeStates(this.state, disk, this.removed, this.resurrected, conflicts);
+				this.state.updatedAt = Date.now();
+				this.pruneAll();
+				if (FileStamp(this.filePath) !== before) continue;
+				AtomicWriteText(this.filePath, JSON.stringify(this.state, null, 2));
+				this.removed.clear();
+				this.resurrected.clear();
+				return;
+			}
+			throw new Error(`Store changed concurrently: ${this.filePath}`);
+		});
 		this.dirty = false;
 	}
 
@@ -407,6 +625,23 @@ export class MnemonicStore {
 		const composedBytes = Buffer.byteLength(JSON.stringify(composed ?? null) ?? "null", "utf8");
 		if (composedBytes > CAPS.valueBytes) throw new Error(`Value too large (${composedBytes} > ${CAPS.valueBytes} bytes).`);
 		meta.value = composed;
+		delete this.state.tombstones?.[root];
+		delete this.state.tombstones?.[key];
+		this.resurrected.add(root);
+		this.resurrected.add(key);
+		this.removed.delete(root);
+		this.removed.delete(key);
+		if (tokens.length > 1) {
+			const relative = fieldKey(tokens.slice(1));
+			meta.fieldTimes = capFieldTimes({ ...meta.fieldTimes, [relative]: now });
+			if (meta.fieldRemoved?.[relative]) {
+				const kept = { ...meta.fieldRemoved };
+				delete kept[relative];
+				meta.fieldRemoved = Object.keys(kept).length ? kept : undefined;
+			}
+		} else {
+			meta.fieldTimes = capFieldTimes({ ...meta.fieldTimes, ["$"]: now });
+		}
 		if (tags.length) meta.tags = [...new Set([...(meta.tags || []), ...tags])].slice(-20);
 		meta.lastUsedAt = now;
 		this.state.registers[root] = meta;
@@ -417,8 +652,18 @@ export class MnemonicStore {
 		const tokens = parsePath(key);
 		const root = tokens[0];
 		if (typeof root !== "string" || !this.state.registers[root]) return false;
-		if (tokens.length === 1) delete this.state.registers[root];
-		else this.state.registers[root].value = deleteAt(this.state.registers[root].value, tokens.slice(1));
+		if (tokens.length === 1) {
+			this.removed.add(key);
+			this.markTombstone(key);
+			delete this.state.registers[root];
+		} else {
+			const meta = this.state.registers[root];
+			meta.value = deleteAt(meta.value, tokens.slice(1));
+			meta.lastUsedAt = Date.now();
+			const relative = fieldKey(tokens.slice(1));
+			meta.fieldTimes = capFieldTimes({ ...meta.fieldTimes, [relative]: meta.lastUsedAt });
+			meta.fieldRemoved = { ...meta.fieldRemoved, [relative]: true };
+		}
 		this.mark();
 		return true;
 	}
@@ -562,7 +807,10 @@ export class MnemonicStore {
 		const before = this.state.techniques.length;
 		this.state.techniques = this.state.techniques.filter((r) => r.name !== name.toLowerCase());
 		const removed = this.state.techniques.length !== before;
-		if (removed) this.mark();
+		if (removed) {
+			this.removed.add(name);
+			this.mark();
+		}
 		return removed;
 	}
 
@@ -570,7 +818,7 @@ export class MnemonicStore {
 		const dir = path.join(path.dirname(this.filePath), "scripts");
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		const file = path.join(dir, `${name.replace(/[^a-z0-9_-]/g, "_")}.sh`);
-		fs.writeFileSync(file, `#!/usr/bin/env bash\nset -euo pipefail\n${renderedCommand}\n`, { mode: 0o700 });
+		AtomicWriteText(file, `#!/usr/bin/env bash\nset -euo pipefail\n${renderedCommand}\n`, 0o700);
 		return file;
 	}
 
@@ -621,6 +869,16 @@ export class MnemonicStore {
 		};
 	}
 
+	allTags(): string[] {
+		const tags = new Set<string>();
+		const collect = (values: string[]) => { for (const tag of values) if (tag) tags.add(tag); };
+		for (const meta of Object.values(this.state.registers)) collect(meta.tags || []);
+		for (const fact of this.state.facts) collect(fact.tags);
+		for (const episode of this.state.episodes) collect(episode.tags);
+		for (const technique of this.state.techniques) collect(technique.tags);
+		return [...tags].slice(0, 200);
+	}
+
 	warm(keys: string[] = []): string[] {
 		for (const key of keys) {
 			const meta = this.state.registers[key];
@@ -665,7 +923,7 @@ export class MnemonicStore {
 		this.mark();
 	}
 
-	Recall(query: string, limit = 8): RecallHit[] {
+	Recall(query: string, limit = 8, options: RecallOptions = {}): RecallHit[] {
 		const stop = new Set(["the", "and", "for", "with", "that", "this", "from", "into", "how", "why", "what", "when", "where", "can", "you", "please", "some", "any"]);
 		const tokens = new Set(
 			String(query || "")
@@ -674,16 +932,21 @@ export class MnemonicStore {
 				.filter((word) => word.length >= 3 && !stop.has(word)),
 		);
 		if (tokens.size === 0) return [];
+		const requested = [...new Set((options.tags || []).map((tag) => String(tag).trim().toLowerCase()).filter(Boolean))].slice(0, 12);
+		const aliases = (tag: string) => [tag, tag.replace(/^(project|concept|task|kind):/, "")].filter(Boolean);
 		const hits: RecallHit[] = [];
 		const queryVector = TokenVector(String(query || ""));
 		const add = (Kind: RecallHit["Kind"], Key: string, Text: string, Tags: string[], item: Scored) => {
 			const haystack = `${Key} ${Text} ${Tags.join(" ")}`.toLowerCase();
+			const present = Tags.map((tag) => String(tag).toLowerCase());
+			const matched = requested.filter((tag) => aliases(tag).some((alias) => present.some((value) => value === alias || value.startsWith(`${alias}:`))));
+			if (requested.length && (options.mode === "any" ? matched.length === 0 : matched.length !== requested.length)) return;
 			const overlap = [...tokens].filter((token) => haystack.includes(token)).length;
 			const phrase = String(query || "").trim().toLowerCase();
 			const exact = phrase.length >= 4 && haystack.includes(phrase) ? 3 : 0;
 			const cosine = Cosine(queryVector, TokenVector(haystack));
-			const base = overlap * 2 + exact + cosine * 5 + Math.min(3, score(item) * 0.2);
-			if (overlap > 0 || cosine > 0.05) hits.push({ Kind, Key, Text: Text.slice(0, 240), Score: Math.round(base * 10) / 10, Tags: [...new Set(Tags)].slice(0, 12) });
+			const base = overlap * 2 + exact + cosine * 5 + Math.min(3, score(item) * 0.2) + matched.length * 2;
+			if (overlap > 0 || cosine > 0.05 || matched.length) hits.push({ Kind, Key, Text: Text.slice(0, 240), Score: Math.round(base * 10) / 10, Tags: [...new Set(Tags)].slice(0, 12), Matched: matched.length ? matched : undefined });
 		};
 		for (const [key, meta] of Object.entries(this.state.registers)) add("Register", key, preview(meta.value, 200), meta.tags || [], meta);
 		for (const fact of this.state.facts) add("Fact", fact.id, fact.claim, fact.tags, fact);
@@ -701,6 +964,10 @@ export class MnemonicStore {
 	}
 
 	private loadCold(): ColdItem[] {
+		return WithFileLock(this.coldFile, () => this.loadColdUnsafe());
+	}
+
+	private loadColdUnsafe(): ColdItem[] {
 		try {
 			if (!fs.existsSync(this.coldFile)) return [];
 			if (fs.statSync(this.coldFile).size > CAPS.coldBytes) {
@@ -717,16 +984,15 @@ export class MnemonicStore {
 	}
 
 	private saveCold(items: ColdItem[]): void {
-		fs.mkdirSync(path.dirname(this.coldFile), { recursive: true, mode: 0o700 });
-		const trimmed = items.slice(-CAPS.cold);
-		let text = JSON.stringify(trimmed, null, 2);
-		while (trimmed.length && Buffer.byteLength(text, "utf8") > CAPS.coldBytes) {
-			trimmed.shift();
-			text = JSON.stringify(trimmed, null, 2);
-		}
-		const tmp = `${this.coldFile}.${process.pid}.tmp`;
-		fs.writeFileSync(tmp, text, { mode: 0o600 });
-		fs.renameSync(tmp, this.coldFile);
+		WithFileLock(this.coldFile, () => {
+			const trimmed = MergeCold(this.loadColdUnsafe(), items).slice(-CAPS.cold);
+			let text = JSON.stringify(trimmed, null, 2);
+			while (trimmed.length && Buffer.byteLength(text, "utf8") > CAPS.coldBytes) {
+				trimmed.shift();
+				text = JSON.stringify(trimmed, null, 2);
+			}
+			AtomicWriteText(this.coldFile, text);
+		});
 	}
 
 	PruneCandidates(options: { ttlDays?: number; maxHits?: number; maxItems?: number } = {}): Array<{ Kind: string; Key: string; Score: number; Reason: string }> {
@@ -763,24 +1029,27 @@ export class MnemonicStore {
 		const moved: ColdItem[] = [];
 		for (const [key, meta] of Object.entries(this.state.registers)) {
 			const hit = byKey.get(`Register|${key}`);
-			if (hit) { moved.push({ Id: id("cold"), Kind: "Register", Key: key, Data: meta, Reason: hit.Reason, At: Date.now() }); delete this.state.registers[key]; }
+			if (hit) { moved.push({ Id: id("cold"), Kind: "Register", Key: key, Data: meta, Reason: hit.Reason, At: Date.now() }); delete this.state.registers[key]; this.removed.add(key); this.markTombstone(key); }
 		}
 		this.state.facts = this.state.facts.filter((fact) => {
 			const hit = byKey.get(`Fact|${fact.id}`);
 			if (!hit) return true;
 			moved.push({ Id: id("cold"), Kind: "Fact", Key: fact.id, Data: fact, Reason: hit.Reason, At: Date.now() });
+			this.removed.add(fact.id); this.removed.add(fact.claim.trim().toLowerCase()); this.markTombstone(fact.id); this.markTombstone(fact.claim.trim().toLowerCase());
 			return false;
 		});
 		this.state.episodes = this.state.episodes.filter((episode) => {
 			const hit = byKey.get(`Episode|${episode.id}`);
 			if (!hit) return true;
 			moved.push({ Id: id("cold"), Kind: "Episode", Key: episode.id, Data: episode, Reason: hit.Reason, At: Date.now() });
+			this.removed.add(episode.id); this.removed.add(episode.summary.trim().toLowerCase()); this.markTombstone(episode.id); this.markTombstone(episode.summary.trim().toLowerCase());
 			return false;
 		});
 		this.state.techniques = this.state.techniques.filter((technique) => {
 			const hit = byKey.get(`Technique|${technique.id}`);
 			if (!hit) return true;
 			moved.push({ Id: id("cold"), Kind: "Technique", Key: technique.id, Data: technique, Reason: hit.Reason, At: Date.now() });
+			this.removed.add(technique.id); this.removed.add(technique.name); this.markTombstone(technique.id); this.markTombstone(technique.name);
 			return false;
 		});
 		for (const collection of [this.state.paths, this.state.commands]) {
@@ -788,6 +1057,7 @@ export class MnemonicStore {
 				const hit = byKey.get(`${collection === this.state.paths ? "Path" : "Command"}|${collection[i].key}`);
 				if (!hit) continue;
 				moved.push({ Id: id("cold"), Kind: collection === this.state.paths ? "Path" : "Command", Key: collection[i].key, Data: collection[i], Reason: hit.Reason, At: Date.now() });
+				this.removed.add(collection[i].key); this.markTombstone(collection[i].key);
 				collection.splice(i, 1);
 			}
 		}
@@ -809,6 +1079,20 @@ export class MnemonicStore {
 		const index = cold.findIndex((item) => item.Key === key);
 		if (index < 0) return false;
 		const item = cold[index];
+		delete this.state.tombstones?.[item.Key];
+		this.resurrected.add(item.Key);
+		this.removed.delete(item.Key);
+		const data = item.Data as Record<string, unknown> | undefined;
+		const aliases = [
+			typeof data?.claim === "string" ? data.claim.trim().toLowerCase() : "",
+			typeof data?.summary === "string" ? data.summary.trim().toLowerCase() : "",
+			typeof data?.name === "string" ? data.name : "",
+		].filter(Boolean);
+		for (const alias of aliases) {
+			delete this.state.tombstones?.[alias];
+			this.resurrected.add(alias);
+			this.removed.delete(alias);
+		}
 		if (item.Kind === "Register" && this.state.registers[item.Key]) return false;
 		if (item.Kind === "Fact" && this.state.facts.some((f) => f.id === (item.Data as Fact)?.id)) return false;
 		if (item.Kind === "Episode" && this.state.episodes.some((e) => e.id === (item.Data as Episode)?.id)) return false;
@@ -994,7 +1278,7 @@ export class MnemonicStore {
 				endTime: new Date(row.At + row.DurationMs).toISOString(),
 				input: { bytes: row.InputBytes, trigger: row.Trigger },
 				output: { bytes: row.OutputBytes },
-				metadata: { model: row.Model, success: row.Success, ...(row.Meta || {}) },
+				metadata: { model: row.Model, success: row.Success, ...row.Meta },
 				level: row.Success ? "DEFAULT" : "ERROR",
 				statusMessage: row.ErrorCode || "",
 			}));
@@ -1029,6 +1313,10 @@ export class MnemonicStore {
 		return count;
 	}
 
+	listConflicts(): MergeConflict[] {
+		return [...this.state.conflicts].slice(-20);
+	}
+
 	stats(): Record<string, unknown> {
 		return {
 			file: this.filePath,
@@ -1040,6 +1328,7 @@ export class MnemonicStore {
 			paths: this.state.paths.length,
 			commands: this.state.commands.length,
 			usageRows: this.state.usage.length,
+			conflicts: this.state.conflicts.length,
 			dirty: this.dirty,
 		};
 	}

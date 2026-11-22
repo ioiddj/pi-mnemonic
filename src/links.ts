@@ -1,16 +1,21 @@
+/**
+ * Markdown link warming and bounded sibling-link weaving. Local targets are
+ * confined to explicit roots; remote URLs are stored without credentials.
+ */
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import type { MnemonicStore } from "./store.ts";
 import { redactCommand } from "./redact.ts";
+import { AtomicUpdateText } from "./file-lock.ts";
 
 export interface WarmedLink {
-	Kind: "file" | "url";
-	Target: string;
-	Label: string;
-	Summary: string;
-	Preview: string;
-	Key: string;
+	readonly Kind: "file" | "url";
+	readonly Target: string;
+	readonly Label: string;
+	readonly Summary: string;
+	readonly Preview: string;
+	readonly Key: string;
 }
 
 const MAX_PREVIEW_BYTES = 8192;
@@ -35,8 +40,18 @@ export function WarmMarkdownLinks(
 	markdown: string,
 	basePath: string,
 	depth = 1,
-	allowedRoot?: string,
+	allowedRoots?: string | string[],
 ): WarmedLink[] {
+	const requestedRoots = Array.isArray(allowedRoots) ? allowedRoots : allowedRoots ? [allowedRoots] : [process.cwd()];
+	const roots = requestedRoots
+		.flatMap((root) => {
+			try {
+				return [fs.realpathSync(path.resolve(root))];
+			} catch {
+				return [];
+			}
+		});
+	const withinRoots = (target: string) => !roots.length || roots.some((root) => target === root || target.startsWith(`${root}${path.sep}`));
 	const warmed: WarmedLink[] = [];
 	const visited = new Set<string>();
 	const queue: Array<{ text: string; base: string; level: number }> = [{ text: markdown, base: basePath, level: 0 }];
@@ -62,10 +77,11 @@ export function WarmMarkdownLinks(
 					continue;
 				}
 				try {
-					const rootReal = allowedRoot ? fs.realpathSync(path.resolve(allowedRoot)) : undefined;
 					target = fs.realpathSync(resolved);
-					if (rootReal && !(target === rootReal || target.startsWith(`${rootReal}${path.sep}`))) continue;
-					if (!fs.statSync(target).isFile() || !/\.md$/i.test(target)) continue;
+					if (!withinRoots(target)) continue;
+					const stat = fs.statSync(target);
+					if (!stat.isFile() && !stat.isDirectory()) continue;
+					if (stat.isFile() && stat.nlink > 1) continue;
 				} catch {
 					continue;
 				}
@@ -76,23 +92,38 @@ export function WarmMarkdownLinks(
 			let Preview = isUrl ? `Remote URL: ${raw}` : "";
 			if (!isUrl) {
 				try {
-					if (!fs.statSync(target).isFile()) continue;
-					const fd = fs.openSync(target, "r");
-					const buffer = Buffer.alloc(Math.min(MAX_PREVIEW_BYTES, fs.statSync(target).size));
-					const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
-					fs.closeSync(fd);
-					const parsed = summaryFrom(buffer.slice(0, read).toString("utf8"), Label);
-					Summary = parsed.summary;
-					Preview = parsed.preview;
+					const stat = fs.statSync(target);
+					if (stat.isDirectory()) {
+						const entries = fs.readdirSync(target).slice(0, 8).join(", ");
+						Preview = `Local directory: ${target}${entries ? `\nEntries: ${entries}` : ""}`;
+					} else if (stat.size > MAX_PREVIEW_BYTES) {
+						Preview = `Local file: ${target} (${stat.size} bytes)`;
+					} else if (stat.size) {
+						const fd = fs.openSync(target, "r");
+						const buffer = Buffer.alloc(stat.size);
+						let read = 0;
+						try {
+							read = fs.readSync(fd, buffer, 0, buffer.length, 0);
+						} finally {
+							fs.closeSync(fd);
+						}
+						if (buffer.slice(0, read).includes(0)) Preview = "Binary file";
+						else {
+							const parsed = summaryFrom(buffer.slice(0, read).toString("utf8"), Label);
+							Summary = parsed.summary;
+							Preview = parsed.preview;
+						}
+					}
 				} catch {
 					Preview = "Local reference could not be read.";
 				}
 			}
 			Summary = redactCommand(Summary);
+			const SafeTarget = isUrl ? redactCommand(target) : target;
 			const Key = slug(target);
-			store.set(Key, { Kind: isUrl ? "url" : "file", Target: target, Label, Summary, Preview }, ["md-link", isUrl ? "url" : "file"]);
-			warmed.push({ Kind: isUrl ? "url" : "file", Target: target, Label, Summary, Preview, Key });
-			if (!isUrl && current.level < maxDepth && /\.md?$/i.test(target) && fs.existsSync(target)) {
+			store.set(Key, { Kind: isUrl ? "url" : "file", Target: SafeTarget, Label, Summary, Preview }, ["md-link", isUrl ? "url" : "file"]);
+			warmed.push({ Kind: isUrl ? "url" : "file", Target: SafeTarget, Label, Summary, Preview, Key });
+			if (!isUrl && current.level < maxDepth && /\.md$/i.test(target) && fs.existsSync(target)) {
 				const text = fs.readFileSync(target, "utf8").slice(0, MAX_PREVIEW_BYTES);
 				queue.push({ text, base: target, level: current.level + 1 });
 			}
@@ -103,32 +134,33 @@ export function WarmMarkdownLinks(
 
 export function WeaveRelatedLinks(markdownPath: string, maxLinks = 10, allowedRoot?: string): { file: string; added: string[] } {
 	const resolved = path.resolve(markdownPath);
-	const rootReal = allowedRoot ? fs.realpathSync(path.resolve(allowedRoot)) : undefined;
+	if (fs.lstatSync(resolved).isSymbolicLink()) throw new Error("Refusing to weave a symlinked file.");
+	const rootReal = allowedRoot ? fs.realpathSync(path.resolve(allowedRoot)) : fs.realpathSync(process.cwd());
 	const resolvedReal = fs.realpathSync(resolved);
-	if (rootReal && !(resolvedReal === rootReal || resolvedReal.startsWith(`${rootReal}${path.sep}`))) throw new Error("Markdown file is outside the allowed root.");
-	if (fs.lstatSync(resolvedReal).isSymbolicLink()) throw new Error("Refusing to weave a symlinked file.");
+	if (!(resolvedReal === rootReal || resolvedReal.startsWith(`${rootReal}${path.sep}`))) throw new Error("Markdown file is outside the allowed root.");
 	if (!/\.md$/i.test(resolved)) throw new Error("PiMnemonicLink Weave requires a markdown file.");
 	const stat = fs.statSync(resolvedReal);
-	if (!stat.isFile() || stat.size > 200_000) throw new Error("Markdown file is not a readable bounded file.");
-	const fd = fs.openSync(resolved, "r");
-	const buffer = Buffer.alloc(stat.size);
-	const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
-	fs.closeSync(fd);
-	const text = buffer.slice(0, read).toString("utf8");
+	if (!stat.isFile() || stat.size > 200_000 || stat.nlink > 1) throw new Error("Markdown file is not a readable bounded regular file.");
 	const dir = path.dirname(resolved);
 	const siblings = fs.readdirSync(dir)
 		.filter((name) => /\.md$/i.test(name) && path.join(dir, name) !== resolvedReal)
 		.slice(0, Math.max(1, Math.min(20, maxLinks)));
-	const existing = new Set([...text.matchAll(/\]\(([^)]+)\)/g)].map((m) => m[1]));
-	const added = siblings
-		.filter((name) => !existing.has(name) && !existing.has(`./${name}`))
-		.map((name) => {
-			const label = name.replace(/\.md$/i, "").replace(/[\][()\r\n]/g, " ").slice(0, 80);
-			return `- [${label}](${encodeURIComponent(name)})`;
-		});
-	if (!added.length) return { file: resolvedReal, added };
-	const section = `\n\n## Related\n\n${added.join("\n")}\n`;
-	if (text.length + section.length > 150_000) return { file: resolvedReal, added: [] };
-	fs.appendFileSync(resolvedReal, section, { mode: 0o600 });
+	let added: string[] = [];
+	AtomicUpdateText(resolvedReal, (text) => {
+		const existing = new Set([...text.matchAll(/\]\(([^)]+)\)/g)].map((m) => m[1]));
+		added = siblings
+			.filter((name) => !existing.has(name) && !existing.has(`./${name}`))
+			.map((name) => {
+				const label = name.replace(/\.md$/i, "").replace(/[\][()\r\n]/g, " ").slice(0, 80);
+				return `- [${label}](${encodeURIComponent(name)})`;
+			});
+		if (!added.length) return text;
+		const section = `\n\n## Related\n\n${added.join("\n")}\n`;
+		if (text.length + section.length > 150_000) {
+			added = [];
+			return text;
+		}
+		return `${text}${section}`;
+	}, "", 150_000);
 	return { file: resolvedReal, added };
 }

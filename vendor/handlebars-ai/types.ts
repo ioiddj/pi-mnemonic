@@ -8,7 +8,7 @@ export interface HelperOptions<T = unknown> {
    loc?: { start: number; end: number };
 }
 
-export type HelperDelegate<T = unknown> = (...args: unknown[]) => unknown;
+export type HelperDelegate = (...args: unknown[]) => unknown;
 
 export interface Template<T = Record<string, unknown>> {
    (context?: T, options?: { data?: Record<string, unknown> }): string;

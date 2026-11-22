@@ -1,4 +1,3 @@
-import { EvaluateTriggers, type TriggerResult } from "./tripwire.ts";
 export { EvaluateTriggers } from "./tripwire.ts";
 export type { TriggerResult } from "./tripwire.ts";
 

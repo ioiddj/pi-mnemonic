@@ -30,9 +30,9 @@ export function KeywordHits(text: string, keywords: string[]): string[] {
 
 export function SafePatternHits(text: string, patterns: string[]): string[] {
 	const reasons: string[] = [];
-	const sample = String(text || "").slice(0, 2000);
+	const sample = String(text || "").slice(0, 20_000);
 	for (const pattern of patterns.slice(0, 16)) {
-		const risky = /\([^)]*[+*][^)]*\)[+*]/.test(pattern) || /\([^)]*\|[^)]*\)[+*{]/.test(pattern) || /\{1,\d*\}\s*[+*]/.test(pattern);
+		const risky = /\([^)]*[+*][^)]*\)[+*{]/.test(pattern) || /\([^)]*\|[^)]*\)[+*{]/.test(pattern) || /\{[^}]*\}\s*[+*{]/.test(pattern) || /[+*]\s*\{/.test(pattern) || /[+*][^)]*\)[+*{]/.test(pattern);
 		if (pattern.length > 200 || risky) continue;
 		try {
 			if (new RegExp(pattern, "i").test(sample)) reasons.push(`Pattern ${pattern}`);

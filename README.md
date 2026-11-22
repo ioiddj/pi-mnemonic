@@ -91,6 +91,7 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 - `/pi-mnemonic-associate on|off|status`
 - `/pi-mnemonic-stats [json|jsonl|eval|langsmith|langfuse|otel] [path]`
 - `/pi-mnemonic-registers`
+- `/pi-mnemonic-dream`
 - `/pi-mnemonic-compat [coexist|mnemonic-primary|engram-primary|off]`
 
 ## Register visualization and engram compatibility
@@ -98,6 +99,12 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 `/pi-mnemonic-registers` opens a themed terminal overlay with views for registers, facts, episodes, techniques, cold storage, and usage. Use `1`-`6` to switch views, arrow/page keys to scroll, `r` to refresh, and `Esc`/`Ctrl+C` to close.
 
 When engram is also installed, pi-mnemonic detects it and reports the overlap. Modes: `coexist` (default), `mnemonic-primary`, `engram-primary`, `off`. In `engram-primary` or `off`, pi-mnemonic suppresses its context injections and idle mining. Changing mode requires operator confirmation.
+
+## Idle miner control
+
+`/pi-mnemonic-dream` opens a centered dialog for the idle miner. Defaults: disabled, idle time 15s, depth 10 sessions, sweep 512KB per session. Controls: `Space` toggle opt-in, `-`/`+` idle time, `[`/`]` depth, `{`/`}` sweep, `j`/`k` or arrows choose a prompt card, `e` edit the selected card, `Enter` save, `Esc` cancel. Changes require operator confirmation.
+
+Editable miner prompts: `PiDream`, `PiTriggerDecision`, and `PiPruneDecision`. They live in `.config/prompts/` and fall back to built-in constants.
 
 ## Observability
 

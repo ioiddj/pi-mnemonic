@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.0] - 2026-11-22
+
+- Added `/pi-mnemonic-dream` control dialog with opt-in enable, idle time, depth, sweep, and prompt-card editing.
+- Idle miner is now off by default and reads depth/sweep/idle settings from registers.
+
 ## [0.4.1] - 2026-11-22
 
 - Polish pass: deterministic fallback fixes for pruning/model calls, telemetry de-duplication, repeat counters, idle miner session detection, Dream confirmations, generated-tool reconciliation, cross-platform technique execution, safe exports, hardened link resolution, real Pi keybinding IDs, and corrected installer npm source.

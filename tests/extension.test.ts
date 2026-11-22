@@ -184,6 +184,23 @@ test("quantitative meta tools return grounded structured output", async () => {
 	assert.equal(event.systemPromptOptions.sections["pi-mnemonic-meta"], "");
 });
 
+test("idle miner config is opt-in and operator-gated", async () => {
+	const { pi, tools, handlers } = MockPi();
+	PiMnemonic(pi);
+	let confirm = false;
+	const ctx: any = { cwd: temp, sessionManager: { getBranch: () => [] }, ui: { notify: () => {}, confirm: async () => confirm } };
+	await handlers.get("session_start")({ reason: "startup" }, ctx);
+	const denied = await tools.get("PiDream").execute("1", { Action: "Config", Enabled: true }, undefined, undefined, ctx);
+	assert.equal(denied.isError, true);
+	confirm = true;
+	const configured = await tools.get("PiDream").execute("2", { Action: "Config", Enabled: true, IdleMs: 30000, Depth: 4, SweepKb: 64 }, undefined, undefined, ctx);
+	const value = JSON.parse(configured.content[0].text);
+	assert.equal(value.Enabled, true);
+	assert.equal(value.IdleMs, 30000);
+	assert.equal(value.Depth, 4);
+	assert.equal(value.SweepKb, 64);
+});
+
 test("engram compatibility mode suppresses overlapping context", async () => {
 	const { pi, tools, handlers } = MockPi();
 	pi.getCommands = () => [{ name: "engram-registers" }];

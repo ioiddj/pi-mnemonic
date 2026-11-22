@@ -12,6 +12,7 @@ import { AssociateSectionName, BuildAssociateContext, BuildAssociations, BuildCo
 import { GenerateCounterfactuals } from "./src/imagine.ts";
 import { PromptStructured } from "./src/intelligence.ts";
 import { CreateRegisterBrowser } from "./src/browser.ts";
+import { CreateDreamPanel, type DreamConfigView } from "./src/dream-panel.ts";
 import { PromptKeys, PromptSource, PromptText, ResetPromptCard, WritePromptCard } from "./src/prompt-cards.ts";
 import { DEFAULT_PROMPTS } from "./src/prompt-defaults.ts";
 import { DEFAULT_CHARTER_PATTERNS, DEFAULT_PRUNE_PATTERNS, DEFAULT_TRIGGER_PATTERNS } from "./src/tripwire.ts";
@@ -251,7 +252,7 @@ function HelpText(): string {
 		"PiMnemonicStats {} — show store counts and caps.",
 		"PiMnemonicHelp { Topic? } — this document.",
 		"",
-		"Commands: /pi-mnemonic-help, /pi-mnemonic-status, /pi-mnemonic-warm [Key,Key].",
+		"Commands: /pi-mnemonic-help, /pi-mnemonic-status, /pi-mnemonic-warm [Key,Key], /pi-mnemonic-registers, /pi-mnemonic-dream, /pi-mnemonic-compat [mode].",
 		"When you notice a reusable trajectory, capability, or new knowledge, call PiMnemonicCodify instead of letting it disappear into the transcript. Prefer Technique/Tool for commands, Skill for multi-step knowledge, and AgentRule for globally important rules.",
 		"AGENTS.md and other markdown context files are interpolated with {{register}} tokens before each run ({{secret:...}} tokens are preserved). Markdown links are warmed into cached hints; PiMnemonicLink Weave links documents to their neighbors. PiDream mines past sessions when memory headroom is available; PiAssociate injects passive session associations; PiImagine/PiSimulate turn outcomes into counterfactual lessons; PiReflect triggers step-back guidance on phrases, turn counts, context pressure, repeated tools, or manual request.",
 		`Caps: ${CAPS.registers} registers, ${CAPS.registerBytes} register bytes, ${CAPS.valueBytes} per value, ${CAPS.facts} facts, ${CAPS.episodes} episodes, ${CAPS.techniques} techniques, ${CAPS.dynamicTools} generated tools.`,
@@ -459,9 +460,10 @@ function SessionFiles(limit: number): string[] {
 	return files.sort((a, b) => b.mtime - a.mtime).slice(0, limit).map((entry) => entry.file);
 }
 
-function ExtractSessionKnowledge(file: string): { facts: string[]; episode?: string; skills: Array<{ name: string; summary: string }> } {
+function ExtractSessionKnowledge(file: string, sweepKb = 512): { facts: string[]; episode?: string; skills: Array<{ name: string; summary: string }> } {
 	const fd = fs.openSync(file, "r");
-	const size = Math.min(BACKGROUND_SESSION_BYTES, fs.statSync(file).size);
+	const sweepBytes = Math.max(16_384, Math.min(4_194_304, sweepKb * 1024));
+		const size = Math.min(sweepBytes, fs.statSync(file).size);
 	const buffer = Buffer.alloc(size);
 	const read = fs.readSync(fd, buffer, 0, size, 0);
 	fs.closeSync(fd);
@@ -503,6 +505,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	let store: MnemonicStore | undefined;
 	let dreamingActive = false;
 	let shuttingDown = false;
+	let dreamTimer: ReturnType<typeof setTimeout> | undefined;
 	let transientPrompt = "";
 	let transientResponse = "";
 	let transientAt = 0;
@@ -667,7 +670,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		const indexed = Array.isArray(indexedRaw) ? (indexedRaw as string[]).filter((x) => typeof x === "string") : [];
 		const set = new Set(indexed);
 		let processed = 0;
-		const configuredMax = Number(current.peek("dream.maxSessions"));
+		const configuredMax = Number(current.peek("dream.maxSessions") ?? current.peek("dream.depth"));
 		const sessionLimit = Number.isFinite(configuredMax) && configuredMax > 0
 			? Math.min(BACKGROUND_MAX_SESSIONS, Math.floor(configuredMax))
 			: BACKGROUND_MAX_SESSIONS;
@@ -678,7 +681,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			if (file === liveFile || set.has(file)) continue;
 			if (!HasHeadroom()) break;
 			try {
-				const knowledge = ExtractSessionKnowledge(file);
+				const knowledge = ExtractSessionKnowledge(file, Number(current.peek("dream.sweepKb") ?? 512));
 				for (const claim of knowledge.facts) current.learn(claim, ["session-mined"], 0.6, file);
 				if (knowledge.episode) current.note(knowledge.episode, `Mined from ${path.basename(file)}`, ["session-mined"]);
 				if (skillApproved) if (skillApproved) for (const skill of knowledge.skills) WriteSkillFile(skill.name, skill.summary, `Mined from ${path.basename(file)}.`, undefined, ["session-mined"]);
@@ -1156,6 +1159,10 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			MaxSessions: Type.Optional(Type.Number()),
 			Promote: Type.Optional(Type.Boolean()),
 			Skill: Type.Optional(Type.Boolean()),
+			Enabled: Type.Optional(Type.Boolean()),
+			IdleMs: Type.Optional(Type.Number()),
+			Depth: Type.Optional(Type.Number()),
+			SweepKb: Type.Optional(Type.Number()),
 			Intelligent: Type.Optional(Type.Boolean()),
 		}),
 		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
@@ -1199,12 +1206,15 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				return Result(promoted.length ? `Promoted ${promoted.join(", ")}` : "No high-confidence facts were promoted.", { promoted });
 			}
 			if (action === "Config") {
-				if (params.Promote !== undefined) {
-					if (!(await OperatorConfirm(ctx, "Allow changing dream auto-promotion?"))) throw new MnemonicError("Operator confirmation required.", "This is an operator-controlled safety setting.");
-					current.set("dream.autoPromote", params.Promote === true, ["dream"]);
-					Flush();
-				}
-				return Result(JSON.stringify({ autoPromote: current.peek("dream.autoPromote") === true, autoSkill: current.peek("dream.autoSkill") === true }));
+				const changed = [params.Promote, params.Enabled, params.IdleMs, params.Depth, params.SweepKb].some((value) => value !== undefined);
+				if (changed && !(await OperatorConfirm(ctx, "Allow changing idle miner configuration?"))) throw new MnemonicError("Operator confirmation required.", "This is an operator-controlled safety setting.");
+				if (params.Promote !== undefined) current.set("dream.autoPromote", params.Promote === true, ["dream"]);
+				if (params.Enabled !== undefined) current.set("dream.enabled", params.Enabled === true, ["dream"]);
+				if (params.IdleMs !== undefined) current.set("dream.idleMs", Math.max(1000, Math.min(600_000, Number(params.IdleMs))), ["dream"]);
+				if (params.Depth !== undefined) current.set("dream.depth", Math.max(1, Math.min(50, Number(params.Depth))), ["dream"]);
+				if (params.SweepKb !== undefined) current.set("dream.sweepKb", Math.max(16, Math.min(4096, Number(params.SweepKb))), ["dream"]);
+				Flush();
+				return Result(JSON.stringify({ ...DreamConfigView(), autoPromote: current.peek("dream.autoPromote") === true, autoSkill: current.peek("dream.autoSkill") === true }));
 			}
 			return Result(JSON.stringify(current.peek("dream.lastRun") || { status: "no run yet" }));
 		}),
@@ -1555,6 +1565,19 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			return Result(PromptText("PiCharter"));
 		}),
 	});
+
+	const DreamConfigView = (): DreamConfigView => {
+		const current = GetStore();
+		const keys = ["PiDream", "PiTriggerDecision", "PiPruneDecision"].filter((key) => PromptKeys().includes(key));
+		return {
+			Enabled: current.peek("dream.enabled") === true,
+			IdleMs: Number(current.peek("dream.idleMs") ?? 15_000),
+			Depth: Number(current.peek("dream.depth") ?? 10),
+			SweepKb: Number(current.peek("dream.sweepKb") ?? 512),
+			PromptKeys: keys,
+			PromptSource: Object.fromEntries(keys.map((key) => [key, PromptSource(key)])),
+		};
+	};
 
 	const PruneConfig = () => {
 		const current = GetStore();
@@ -2011,12 +2034,52 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	pi.on("agent_settled", async (event, ctx) => {
 		if ((event as unknown as AnyRecord).aborted) return;
 		if (["off", "engram-primary"].includes(CompatMode())) return;
-		await DreamRun(ctx, GetStore().peek("dream.autoPromote") === true, false, false, GetStore().peek("dream.autoPromote") === true, GetStore().peek("dream.autoSkill") === true);
+		const current = GetStore();
+		if (current.peek("dream.enabled") !== true) return;
+		if (dreamTimer) clearTimeout(dreamTimer);
+		const idleMs = Math.max(1000, Number(current.peek("dream.idleMs") ?? 15_000));
+		dreamTimer = setTimeout(async () => {
+			dreamTimer = undefined;
+			await DreamRun(ctx, current.peek("dream.autoPromote") === true, false, false, current.peek("dream.autoPromote") === true, current.peek("dream.autoSkill") === true);
+		}, idleMs);
+		dreamTimer.unref?.();
 	});
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		if (dreamTimer) clearTimeout(dreamTimer);
 		Flush();
+	});
+
+	pi.registerCommand("pi-mnemonic-dream", {
+		description: "Open the idle miner control dialog",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
+				ctx.ui.notify("/pi-mnemonic-dream needs an interactive Pi session", "error");
+				return;
+			}
+			const result = await ctx.ui.custom<any>(
+				(tui: any, theme: any, keybindings: any, done: (value: any) => void) => CreateDreamPanel(DreamConfigView(), tui, theme, keybindings, done) as any,
+				{ overlay: true, overlayOptions: { anchor: "center", width: 76, maxHeight: 20 }, blocked: { kind: "question", message: "Idle miner control" } },
+			);
+			if (!result?.Save) return;
+			if (!(await OperatorConfirm(ctx, "Apply idle miner configuration changes?"))) return;
+			const current = GetStore();
+			current.set("dream.enabled", result.Enabled, ["dream"]);
+			current.set("dream.idleMs", result.IdleMs, ["dream"]);
+			current.set("dream.depth", result.Depth, ["dream"]);
+			current.set("dream.sweepKb", result.SweepKb, ["dream"]);
+			Flush();
+			ctx.ui.notify(`Idle miner ${result.Enabled ? "enabled" : "disabled"} • idle ${Math.round(result.IdleMs / 1000)}s • depth ${result.Depth} • sweep ${result.SweepKb}KB`, "info");
+			if (result.EditKey) {
+				const existing = PromptText(result.EditKey);
+				const next = await ctx.ui.editor(`Edit ${result.EditKey}`, existing);
+				if (next !== undefined && (await OperatorConfirm(ctx, `Save prompt card ${result.EditKey}?`))) {
+					WritePromptCard(result.EditKey, next);
+					ctx.ui.notify(`Saved ${result.EditKey}`, "info");
+				}
+			}
+		},
 	});
 
 	pi.registerCommand("pi-mnemonic-registers", {

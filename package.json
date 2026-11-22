@@ -1,6 +1,6 @@
 {
   "name": "@ioiddj/pi-mnemonic",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": false,
   "type": "module",
   "description": "Bounded working memory, associative recall, metacognition tools, and editable prompt cards for Pi coding agents",
@@ -47,7 +47,8 @@
     "uninstall.ps1",
     "src/browser.ts",
     "docs/pi/**/*",
-    "skills/**/*"
+    "skills/**/*",
+    "src/dream-panel.ts"
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.ts",

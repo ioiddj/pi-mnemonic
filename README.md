@@ -2,6 +2,18 @@
 
 Bounded working memory for Pi: registers, facts, recent work, reusable techniques, template interpolation, and generated tools. See [REQUIREMENTS.md](./REQUIREMENTS.md) for the full contract.
 
+## Install
+
+```sh
+pi install git:github.com/ioiddj/pi-mnemonic
+```
+
+Once published to npm:
+
+```sh
+pi install npm:@ioiddj/pi-mnemonic
+```
+
 ## Load
 
 Auto-discovered from `~/.pi/agent/extensions/pi-mnemonic/index.ts`. Manual reflection: `/pi-mnemonic-reflect [focus]`. Automatic triggers include matching phrases, every 12 turns, high context usage, repeated tools, and manual/agent calls.

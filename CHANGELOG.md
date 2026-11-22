@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.0] - 2026-11-22
+
+- Added cross-platform install/uninstall scripts (`install.sh`, `uninstall.sh`, `install.ps1`, `uninstall.ps1`, Node installer).
+- Added npm scripts for git/npm/local install and uninstall.
+
 ## [0.2.0] - 2026-11-22
 
 - Added opt-in `PiStats` observability and `/pi-mnemonic-stats` command.

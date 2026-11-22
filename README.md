@@ -4,15 +4,38 @@ Bounded working memory for Pi: registers, facts, recent work, reusable technique
 
 ## Install
 
+Cross-platform installers are included:
+
+```sh
+# POSIX (macOS/Linux/WSL)
+./install.sh
+
+# Windows PowerShell
+.\install.ps1
+
+# Node, any platform
+node scripts/pi-mnemonic-install.mjs
+```
+
+Direct Pi commands:
+
 ```sh
 pi install git:github.com/ioiddj/pi-mnemonic
-```
-
-Once published to npm:
-
-```sh
+# once published to npm
 pi install npm:@ioiddj/pi-mnemonic
 ```
+
+Options: `--git` (default), `--npm`, `--local`, `--source <spec>`, `--project`/`-l`, `--dry-run`.
+
+Uninstall:
+
+```sh
+./uninstall.sh
+.\uninstall.ps1
+node scripts/pi-mnemonic-install.mjs --uninstall
+```
+
+Uninstall removes the git, npm, and local sources by default.
 
 ## Load
 
@@ -106,7 +129,7 @@ Secrets and PII should be handled by reference only through `pi-credentials`. Th
 ## Development
 
 ```sh
-npm run check   # tsc --noEmit + node:test (37 tests)
+npm run check   # tsc --noEmit + node:test
 npm run smoke   # pi -p -e ./index.ts "Reply with OK only"
 ```
 

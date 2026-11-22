@@ -200,6 +200,13 @@ The extension/package keeps the required `pi-` prefix. LLM-facing tool names use
 - `PiStats Query` filters by `SinceMs`; `Reset` clears the bounded 2,000-row history.
 - Built-in tool outcomes are observed via `tool_execution_end`; PiMnemonic tool calls are wrapped automatically.
 
+### R22 — Cross-platform installation
+
+- `scripts/pi-mnemonic-install.mjs` wraps `pi install` / `pi remove` using Node's `spawnSync`, avoiding shell quoting differences.
+- POSIX and PowerShell wrappers provide `install.sh`, `uninstall.sh`, `install.ps1`, `uninstall.ps1`.
+- Supports git (default), npm, local checkout, explicit source, project-local settings, dry-run, and uninstall of all known sources.
+- Installers change only Pi settings via the Pi CLI; they do not edit settings files directly.
+
 ## Safety and bounds
 
 - All collections have explicit caps in `store.ts` and are pruned before save.

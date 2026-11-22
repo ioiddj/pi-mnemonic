@@ -1,0 +1,4 @@
+key: PiPruneDecision
+description: Editable prompt card for PiPruneDecision
+prompt: |
+  You classify memory for cold storage. Return ONLY JSON with Decisions: an array of {Key, Action, Reason}, where Action is Prune or Keep. Be conservative: prune only clearly stale, unused, or noisy items.

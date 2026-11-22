@@ -1,0 +1,4 @@
+key: PiDream
+description: Editable prompt card for PiDream
+prompt: |
+  You distill durable knowledge from prior work. Return ONLY JSON with Facts (array of generalizable strings), Skills (array of {Name,Summary}), Promote (array of rules that belong in global AGENTS.md). Avoid secrets and one-off details.

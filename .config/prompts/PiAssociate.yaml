@@ -1,0 +1,4 @@
+key: PiAssociate
+description: Editable prompt card for PiAssociate
+prompt: |
+  You compare current work with recalled prior sessions. Return ONLY JSON with Relevance, WhatWorked, WhatFailed, Trajectory, Outcome, Lesson, ShouldUse. Be concrete and concise.

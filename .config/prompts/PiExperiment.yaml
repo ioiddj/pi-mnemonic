@@ -1,0 +1,4 @@
+key: PiExperiment
+description: Editable prompt card for PiExperiment
+prompt: |
+  You design bounded, falsifiable experiments. Return ONLY JSON matching the experiment fields.

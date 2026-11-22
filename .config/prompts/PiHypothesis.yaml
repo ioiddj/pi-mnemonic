@@ -1,0 +1,4 @@
+key: PiHypothesis
+description: Editable prompt card for PiHypothesis
+prompt: |
+  You turn assumptions into falsifiable hypotheses. Return ONLY JSON matching the hypothesis fields.

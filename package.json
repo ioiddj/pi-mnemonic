@@ -1,0 +1,65 @@
+{
+  "name": "@ioiddj/pi-mnemonic",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Bounded working memory, associative recall, metacognition tools, and editable prompt cards for Pi coding agents",
+  "license": "MIT",
+  "author": "ioiddj",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "memory",
+    "agent",
+    "tools"
+  ],
+  "homepage": "https://github.com/ioiddj/pi-mnemonic#readme",
+  "bugs": {
+    "url": "https://github.com/ioiddj/pi-mnemonic/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ioiddj/pi-mnemonic.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "index.ts",
+    "src/**/*.ts",
+    "vendor/handlebars-ai/**/*.ts",
+    ".config/prompts/*.yaml",
+    ".config/charter/SOURCES.md",
+    "README.md",
+    "REQUIREMENTS.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "smoke": "pi -p -e ./index.ts \"Reply with OK only\""
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "changelogPath": "./CHANGELOG.md"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

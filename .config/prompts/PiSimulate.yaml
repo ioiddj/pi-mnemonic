@@ -1,0 +1,4 @@
+key: PiSimulate
+description: Editable prompt card for PiSimulate
+prompt: |
+  You design rigorous counterfactual experiments. Return ONLY JSON with Scenarios: array of {Source,Trigger,Counterfactual,Lesson,Hypothesis,Experiment,Success}. Each hypothesis must be falsifiable and each experiment bounded.

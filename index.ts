@@ -80,6 +80,8 @@ function ParseValue(raw: string | undefined, field: string): unknown {
 			throw new MnemonicError(`${field} looks like JSON but did not parse.`, `Pass valid JSON, or prefix plain text with a word (for example: "hostport=8787").`);
 		}
 	}
+	if (text === "true") return true;
+	if (text === "false") return false;
 	return raw;
 }
 
@@ -219,6 +221,7 @@ function HelpText(): string {
 		"PiPredict — evidence-grounded forecast. PiRiskAssessment / PiAssessment — quantitative risk register. PiQuantify / PiModel — bounded variable model. PiHypothesis — falsifiable hypothesis. PiExperiment — bounded experiment design, optionally run via a PiTechnique.",
 		"PiPrompt { Action: List|Get|Set|Reset, Key?, Prompt? } — edit YAML prompt cards in .config/prompts; defaults remain in src/prompt-defaults.ts.",
 		"PiPrune { Action: Preview|Run|Restore|Status|Config, Key?, Focus?, Reason?, Intelligent? } — move unused/noisy memory into cold storage; supports manual, agent, regex/keyword/code, and typed decision triggers.",
+		"PiStats { Action: Dump|Enable|Disable|Export|Query|Reset, Format?, Path?, Limit?, SinceMs? } — opt-in usage telemetry and exports to JSON/JSONL/eval/LangSmith/Langfuse/OTel.",
 		"PiCharter { Action: Show|Config|Enable|Disable|Source, Mode?, EveryNTurns? } — operating charter with source links; default trigger mode fires only for sanctioned-party or sanctions/export-control work (modes always/trigger/periodic/off).",
 		"Pin syntax in markdown: {{key!important}}, {{key#alwayson}}, {{key//remember}} pin a register/fact/episode/technique so pruning skips it. Source index: .config/charter/SOURCES.md.",
 		"Repeated PiAssociate signals can promote cold items back into active memory when associate.promoteThreshold hits (default 5).",
@@ -491,6 +494,45 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			pi.events.emit("pi-mnemonic:flush-error", { message: String(error) });
 		}
 	};
+	const ObserveEnabled = () => GetStore().peek("observability.enabled") === true;
+	const ByteCount = (value: unknown): number => {
+		try { return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8"); } catch { return 0; }
+	};
+	const RecordToolUsage = (tool: string, params: AnyRecord, started: number, result: unknown, error?: unknown, modelId?: string) => {
+		if (!ObserveEnabled()) return;
+		const store = GetStore();
+		const action = String(params?.Action || params?.Kind || params?.Topic || "");
+		store.RecordUsage({
+			Tool: tool,
+			Action: action,
+			DurationMs: Date.now() - started,
+			Success: !error && !(result as AnyRecord)?.isError,
+			ErrorCode: error instanceof Error ? error.name : undefined,
+			InputBytes: ByteCount(params),
+			OutputBytes: ByteCount(result),
+			Model: String(modelId || ""),
+			Meta: { source: "tool" },
+		});
+		Flush();
+	};
+	const RegisterTool = (definition: AnyRecord) => {
+		pi.registerTool({
+			...(definition as any),
+			execute: async (toolCallId: string, params: AnyRecord, signal: AbortSignal | undefined, onUpdate: unknown, ctx: any) => {
+				const started = Date.now();
+				try {
+					const result = await (definition as any).execute(toolCallId, params, signal, onUpdate, ctx);
+					RecordToolUsage(String(definition.name), params, started, result, undefined, String(ctx?.model?.id || ""));
+					return result;
+				} catch (error) {
+					RecordToolUsage(String(definition.name), params, started, undefined, error, String(ctx?.model?.id || ""));
+					throw error;
+				}
+			},
+		});
+	};
+
+
 	const StoreVariables = (): AnyRecord => {
 		const context: AnyRecord = {};
 		for (const row of GetStore().list("", true)) {
@@ -534,7 +576,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			const props: Record<string, ReturnType<typeof Type.String>> = {};
 			for (const param of technique.params) props[param] = Type.String({ description: `Value for ${param}` });
 			generatedTools.set(technique.id, toolName);
-			pi.registerTool({
+			RegisterTool({
 				name: toolName,
 				label: toolName,
 				description: `${technique.description} Usage: ${technique.usage}`,
@@ -598,7 +640,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}
 	};
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicHelp",
 		label: "Pi Mnemonic Help",
 		description: "Return the PiMnemonic tool API, examples, and caps. Use when unsure which memory tool to call.",
@@ -606,7 +648,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: Execute((params: AnyRecord) => Result(HelpText(), { topic: params.Topic || "all" })),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicSet",
 		label: "Pi Mnemonic Set",
 		description: "Store a keyed register. Key supports dot/bracket paths. Value is JSON if it starts with { or [, otherwise plain text.",
@@ -626,7 +668,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicGet",
 		label: "Pi Mnemonic Get",
 		description: "Read a register (bumps its hit count). Optional Template renders Handlebars using registers plus Vars.",
@@ -646,7 +688,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicList",
 		label: "Pi Mnemonic List",
 		description: "List register names and metadata. Values are hidden unless IncludeValues is true.",
@@ -657,7 +699,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: Execute((params: AnyRecord) => Result(JSON.stringify(GetStore().list(String(params.Prefix || ""), Boolean(params.IncludeValues)), null, 2))),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicDelete",
 		label: "Pi Mnemonic Delete",
 		description: "Delete a register or nested path.",
@@ -669,7 +711,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicLearn",
 		label: "Pi Mnemonic Learn",
 		description: "Store a deduplicated generalizable fact learned from work. Facts are injected into future context when hot.",
@@ -687,7 +729,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicNote",
 		label: "Pi Mnemonic Note",
 		description: "Record recent work as an episode so the next run starts warm. Use after finishing meaningful work.",
@@ -704,7 +746,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicRender",
 		label: "Pi Mnemonic Render",
 		description: "Render a Handlebars template using stored registers plus Vars. Supports #each, lookup, if, count, at.",
@@ -717,7 +759,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: Execute((params: AnyRecord) => Result(RenderWith(String(params.Template), ParseVars(params.Vars as string | undefined)))),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiTechnique",
 		label: "Pi Mnemonic Technique",
 		description: "Manage deterministic command techniques. Actions: Add, Get, List, Render, Delete, Hit, Script, Expose, Exec.",
@@ -807,7 +849,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicWarm",
 		label: "Pi Mnemonic Warm",
 		description: "Bump hit counts for named registers (or current hot registers) and return a compact warm context.",
@@ -820,7 +862,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicRecall",
 		label: "Pi Mnemonic Recall",
 		description: "Associative recall of registers, facts, episodes, and techniques using token overlap, exact-phrase boost, hits, and recency. No embedding DB.",
@@ -835,7 +877,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicCodify",
 		label: "Pi Mnemonic Codify",
 		description: "Persist a reusable technique discovered during work. Kind: Register, Technique, Tool, or Skill. Technique/Tool create deterministic callable commands; Skill writes a SKILL.md.",
@@ -898,7 +940,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiMnemonicLink",
 		label: "Pi Mnemonic Link",
 		description: "Warm markdown references into cached hints, or weave a Related section linking a document to neighboring markdown files.",
@@ -995,7 +1037,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		return result;
 	};
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiAssociate",
 		label: "Pi Associate",
 		description: "Passive session association. Toggle on/off or inspect status. When on, prompts and responses are matched against prior sessions to surface useful experience.",
@@ -1041,7 +1083,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiDream",
 		label: "Pi Dream",
 		description: "Idle knowledge miner namespace. Run a pass, inspect status, promote high-confidence rules to AGENTS.md, or configure the miner.",
@@ -1099,7 +1141,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiPlan",
 		label: "Pi Plan",
 		description: "Store a bounded plan with steps and constraints, then return associations from prior work that can inform it.",
@@ -1133,7 +1175,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiImagine",
 		label: "Pi Imagine",
 		description: "Speculative counterfactuals: how a session could have gone differently and what lesson is worth keeping for a similar situation.",
@@ -1175,7 +1217,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiSimulate",
 		label: "Pi Simulate",
 		description: "Rigorous counterfactuals with Hypothesis, Experiment, and Success criteria derived from prior outcomes.",
@@ -1225,7 +1267,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		Intelligent: Type.Optional(Type.Boolean()),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiPredict",
 		label: "Pi Predict",
 		description: "Grounded forecast from recalled evidence: trajectory, confidence, base rate, drivers, counter-evidence, and stop conditions.",
@@ -1251,7 +1293,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		return Result(JSON.stringify(result, null, 2), result, result);
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiRiskAssessment",
 		label: "Pi Risk Assessment",
 		description: "Quantitative risk register from past evidence: likelihood, impact, score, mitigations, and stop conditions.",
@@ -1260,7 +1302,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: RiskExecute,
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiAssessment",
 		label: "Pi Assessment",
 		description: "Alias of PiRiskAssessment.",
@@ -1278,7 +1320,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		return Result(JSON.stringify(result, null, 2), result, result);
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiQuantify",
 		label: "Pi Quantify",
 		description: "Turn evidence into a bounded quantitative model with variables, formula, estimate, uncertainty, and next measurement.",
@@ -1287,7 +1329,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: QuantExecute,
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiModel",
 		label: "Pi Model",
 		description: "Alias of PiQuantify.",
@@ -1296,7 +1338,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: QuantExecute,
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiHypothesis",
 		label: "Pi Hypothesis",
 		description: "Turn an assumption into a falsifiable hypothesis with metrics, success criterion, falsifier, and cost.",
@@ -1313,7 +1355,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiExperiment",
 		label: "Pi Experiment",
 		description: "Design a bounded experiment, optionally run it through a registered PiTechnique, and record the observation as evidence.",
@@ -1381,7 +1423,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}, null, 2));
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiReflect",
 		label: "Pi Reflect",
 		description: "Conditional metacognition: evaluate whether current work is useful, rational, aligned, novel, and worth continuing; inject objective steering into the next prompt.",
@@ -1392,7 +1434,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		execute: ReflectExecute,
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiObserve",
 		label: "Pi Observe",
 		description: "Alias of PiReflect: observe the current trajectory and inject structured next-turn steering.",
@@ -1411,7 +1453,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		};
 	};
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiCharter",
 		label: "Pi Charter",
 		description: "Show and configure the always-on/conditional/periodic operating charter with links to source material.",
@@ -1459,7 +1501,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		};
 	};
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiPrune",
 		label: "Pi Prune",
 		description: "Move stale, unused, or noisy memory into bounded cold storage. Manual, agent, or tripwire triggered; optional typed decision model.",
@@ -1530,7 +1572,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
 		name: "PiPrompt",
 		label: "Pi Prompt",
 		description: "List, read, edit, or reset editable YAML prompt cards for the meta-cognition tools.",
@@ -1558,7 +1600,56 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerTool({
+	RegisterTool({
+		name: "PiStats",
+		label: "Pi Stats",
+		description: "Dump extension stats and export bounded usage rows to JSON/JSONL/eval/LangSmith/Langfuse/OTel formats. Opt-in observability.",
+		parameters: Type.Object({
+			Action: StringEnum(["Dump", "Enable", "Disable", "Export", "Query", "Reset"] as const),
+			Format: Type.Optional(StringEnum(["json", "jsonl", "eval", "langsmith", "langfuse", "otel"] as const)),
+			Path: Type.Optional(Type.String()),
+			Limit: Type.Optional(Type.Number()),
+			SinceMs: Type.Optional(Type.Number()),
+		}),
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: any) => {
+			const action = String(params.Action || "Dump");
+			const current = GetStore();
+			if (action === "Enable" || action === "Disable") {
+				if (!(await OperatorConfirm(ctx, "Allow changing opt-in observability?"))) throw new MnemonicError("Operator confirmation required.", "Usage recording is opt-in.");
+				current.set("observability.enabled", action === "Enable", ["observability"]);
+				Flush();
+				return Result(`Usage recording ${action === "Enable" ? "enabled" : "disabled"}.`);
+			}
+			if (action === "Reset") {
+				if (!(await OperatorConfirm(ctx, "Allow clearing usage history?"))) throw new MnemonicError("Operator confirmation required.", "Reset deletes bounded usage rows.");
+				const removed = current.ClearUsage();
+				Flush();
+				return Result(`Cleared ${removed} usage rows.`);
+			}
+			const since = Number(params.SinceMs || 0);
+			const limit = Math.max(1, Math.min(CAPS.usage, Number(params.Limit || 200)));
+			if (action === "Query") {
+				const rows = current.UsageRows(limit).filter((row) => row.At >= since);
+				return Result(JSON.stringify(rows, null, 2), { rows });
+			}
+			if (action === "Export") {
+				const format = String(params.Format || "json");
+				if (params.Path && !(await OperatorConfirm(ctx, "Allow writing usage export to disk?"))) throw new MnemonicError("Operator confirmation required.", "Exports can contain operational metadata.");
+				const data = current.ExportUsage(format, limit);
+				const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+				if (params.Path) {
+					const file = path.resolve(String(params.Path).replace(/^@/, ""));
+					fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+					fs.writeFileSync(file, text, { mode: 0o600 });
+					return Result(`Exported ${format} to ${file}`, { file, format, rows: Array.isArray(data) ? data.length : 1 });
+				}
+				return Result(text, { format, data });
+			}
+			return Result(JSON.stringify({ Config: current.peek("observability.enabled") === true, Store: current.stats(), Usage: current.UsageStats() }, null, 2));
+		}),
+	});
+
+	RegisterTool({
 		name: "PiMnemonicStats",
 		label: "Pi Mnemonic Stats",
 		description: "Show store counts, file path, and caps.",
@@ -1589,6 +1680,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		const contextStarted = Date.now();
 		const current = GetStore();
 		event.systemPromptOptions.sections[ContextSectionName()] = BuildContext(current, 4000);
 		const promptText = event.messageType === "user"
@@ -1723,6 +1815,15 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}
 		event.systemPromptOptions.sections[LinkSectionName()] = BuildLinkHints(current);
 		current.pathHit(event.systemPromptOptions.cwd || ctx.cwd);
+		if (ObserveEnabled()) {
+			const sections = event.systemPromptOptions.sections as Record<string, string | null>;
+			const sectionBytes = Object.entries(sections).reduce((sum, [name, value]) => sum + (name.startsWith("pi-mnemonic") ? Buffer.byteLength(value || "", "utf8") : 0), 0);
+			current.RecordUsage({
+				Tool: "context", Action: "before_agent_start", DurationMs: Date.now() - contextStarted,
+				Success: true, InputBytes: Buffer.byteLength(promptText, "utf8"), OutputBytes: sectionBytes,
+				Model: String(ctx?.model?.id || ""), Meta: { source: "hook", sections: Object.keys(sections).filter((name) => name.startsWith("pi-mnemonic")) },
+			});
+		}
 		Flush();
 	});
 
@@ -1736,6 +1837,23 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		const current = GetStore();
 		Flush();
 		pi.appendEntry("pi-mnemonic-compact", current.compactSnapshot());
+	});
+
+	pi.on("tool_execution_end", async (event, ctx) => {
+		if (!ObserveEnabled()) return;
+		const raw = event as unknown as AnyRecord;
+		GetStore().RecordUsage({
+			Tool: String(raw.toolName || "builtin"),
+			Action: "execute",
+			DurationMs: Number(raw.durationMs) || 0,
+			Success: !raw.isError,
+			ErrorCode: raw.error ? String((raw.error as AnyRecord)?.name || "error") : undefined,
+			InputBytes: ByteCount(raw.input),
+			OutputBytes: ByteCount(raw.result),
+			Model: String(ctx?.model?.id || ""),
+			Meta: { source: "tool_execution_end" },
+		});
+		Flush();
 	});
 
 	pi.on("agent_end", async (event) => {
@@ -1778,6 +1896,33 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
 		Flush();
+	});
+
+	pi.registerCommand("pi-mnemonic-stats", {
+		description: "Dump usage stats or export: /pi-mnemonic-stats [json|jsonl|eval|langsmith|langfuse|otel] [path]",
+		handler: async (args, ctx) => {
+			const [arg, outPath] = args.trim().split(/\s+/);
+			const current = GetStore();
+			if (arg === "enable" || arg === "disable") {
+				if (!(await OperatorConfirm(ctx, "Allow changing opt-in observability?"))) return;
+				current.set("observability.enabled", arg === "enable", ["observability"]);
+				Flush();
+				ctx.ui.notify(`Usage recording ${arg}d.`, "info");
+				return;
+			}
+			if (arg && outPath && !(await OperatorConfirm(ctx, "Allow writing usage export to disk?"))) return;
+			const data = current.ExportUsage(arg || "json", 200);
+			const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+			if (outPath) {
+				const file = path.resolve(outPath.replace(/^@/, ""));
+				fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+				fs.writeFileSync(file, text, { mode: 0o600 });
+				ctx.ui.notify(`Exported to ${file}`, "info");
+				return;
+			}
+			ctx.ui.notify(`Usage rows: ${Number(current.stats().usageRows)}; stats dumped to session.`, "info");
+			pi.sendMessage({ customType: "pi-mnemonic-stats", content: JSON.stringify({ Store: current.stats(), Usage: current.UsageStats(), Export: text.slice(0, 20_000) }, null, 2), display: true });
+		},
 	});
 
 	pi.registerCommand("pi-mnemonic-help", {

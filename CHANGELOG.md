@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.0] - 2026-11-22
+
+- Added opt-in `PiStats` observability and `/pi-mnemonic-stats` command.
+- Bounded usage rows with aggregate stats and exports to JSON, JSONL, eval, LangSmith, Langfuse, and OTel shapes.
+- Automatic instrumentation of PiMnemonic tools, context sections, and built-in tool outcomes.
+
 ## [0.1.0] - 2026-11-22
 
 Initial public release.

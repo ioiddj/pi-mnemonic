@@ -53,6 +53,7 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 - `PiPrompt { Action: List|Get|Set|Reset, Key?, Prompt? }` — manage editable YAML prompt cards.
 - `PiPrune { Action: Preview|Run|Restore|Status|Config }` — move stale/noisy memory into bounded cold storage, restore it, or configure triggers.
 - `PiCharter { Action: Show|Config|Enable|Disable|Source }` — operating charter with source links; default mode `trigger` fires on sanctions/export-control keywords in the prompt (including incidental mentions); it is prompt guidance, not a compliance determination. `always`, `periodic`, `off` also available.
+- `PiStats { Action: Dump|Enable|Disable|Export|Query|Reset, Format?, Path?, Limit?, SinceMs? }` — opt-in usage telemetry and exports.
 - `PiMnemonicStats {}` — counts and caps.
 
 `Expose` creates `PiTechnique<Name>` tools with one string parameter per declared `Params` entry. Generated commands are capped at 30 s and 20 KiB output.
@@ -64,6 +65,13 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 - `/pi-mnemonic-warm Key,Key`
 - `/pi-mnemonic-reflect [focus]`
 - `/pi-mnemonic-associate on|off|status`
+- `/pi-mnemonic-stats [json|jsonl|eval|langsmith|langfuse|otel] [path]`
+
+## Observability
+
+Usage telemetry is **off by default**. Enable with `PiStats Enable` or `/pi-mnemonic-stats enable` (operator confirmation required). While enabled, the extension records bounded metadata only: tool/action, timestamp, duration, success/error, input/output byte counts, model id, trigger labels, and section sizes. It does not persist raw prompts, values, or command text.
+
+`PiStats Dump` shows aggregates; `Export` writes JSON/JSONL/eval/LangSmith/Langfuse/OTel-shaped rows to the session or a file. `Reset` clears bounded history. Exports and enable/disable operations require confirmation.
 
 ## Charter and pinning
 

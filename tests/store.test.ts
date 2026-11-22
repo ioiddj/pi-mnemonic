@@ -154,6 +154,22 @@ test("register paths reject prototype keys and huge indices", () => {
 	assert.equal(({} as AnyRecord).polluted, undefined);
 });
 
+test("usage rows aggregate and export to observability formats", () => {
+	const { store } = tempStore();
+	store.RecordUsage({ Tool: "PiMnemonicGet", Action: "get", DurationMs: 10, Success: true, InputBytes: 20, OutputBytes: 30, Model: "test-model" });
+	store.RecordUsage({ Tool: "PiMnemonicGet", Action: "get", DurationMs: 30, Success: false, ErrorCode: "TestError", InputBytes: 10, OutputBytes: 5 });
+	const stats = store.UsageStats();
+	assert.equal(stats.Total, 2);
+	const byTool = stats.ByTool as Array<Record<string, unknown>>;
+	assert.equal(byTool[0].Calls, 2);
+	assert.equal(byTool[0].Errors, 1);
+	for (const format of ["json", "jsonl", "eval", "langsmith", "langfuse", "otel"]) {
+		const data = store.ExportUsage(format, 10);
+		assert.ok(typeof data === "string" ? data.length > 0 : Array.isArray(data) && data.length === 2);
+	}
+	assert.equal(store.ClearUsage(), 2);
+});
+
 test("corrupt store is quarantined and replaced", () => {
 	const { store, file } = tempStore();
 	fs.mkdirSync(path.dirname(file), { recursive: true });

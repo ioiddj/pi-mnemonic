@@ -1,6 +1,6 @@
 {
   "name": "@ioiddj/pi-mnemonic",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "description": "Bounded working memory, associative recall, metacognition tools, and editable prompt cards for Pi coding agents",

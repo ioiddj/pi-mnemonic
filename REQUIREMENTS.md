@@ -191,6 +191,15 @@ The extension/package keeps the required `pi-` prefix. LLM-facing tool names use
 - `Store.Pin/Unpin` support scoped pins (`pinnedScopes`).
 - Repeated PiAssociate signals increment `Signal` on matching cold items; at `associate.promoteThreshold` (default 5) the item is restored to active memory and reported in the association section.
 
+### R21 — Opt-in observability
+
+- Usage telemetry is disabled by default. `PiStats Enable`/`Disable` and `/pi-mnemonic-stats enable|disable` require operator confirmation.
+- While enabled, bounded rows record tool/action, timestamp, duration, success/error, input/output byte counts, model id, trigger labels, and section sizes. Raw prompts, values, and command text are not persisted by telemetry.
+- `PiStats Dump` aggregates by tool/action/model/trigger with calls, success/error, avg/p95 duration, and byte totals.
+- `PiStats Export` supports `json`, `jsonl`, `eval`, `langsmith`, `langfuse`, and `otel` shapes; file exports require confirmation and write 0600.
+- `PiStats Query` filters by `SinceMs`; `Reset` clears the bounded 2,000-row history.
+- Built-in tool outcomes are observed via `tool_execution_end`; PiMnemonic tool calls are wrapped automatically.
+
 ## Safety and bounds
 
 - All collections have explicit caps in `store.ts` and are pruned before save.

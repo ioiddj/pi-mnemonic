@@ -36,7 +36,7 @@ test("registers PascalCase tools and lowercase kebab commands", () => {
 		"PiMnemonicHelp", "PiMnemonicSet", "PiMnemonicGet", "PiMnemonicList", "PiMnemonicDelete",
 		"PiMnemonicLearn", "PiMnemonicNote", "PiMnemonicRender", "PiTechnique", "PiMnemonicWarm", "PiMnemonicRecall", "PiMnemonicCodify", "PiMnemonicLink",
 		"PiAssociate", "PiDream", "PiPlan", "PiImagine", "PiSimulate", "PiReflect", "PiObserve",
-		"PiPredict", "PiRiskAssessment", "PiAssessment", "PiQuantify", "PiModel", "PiHypothesis", "PiExperiment", "PiPrune", "PiCharter", "PiPrompt", "PiMnemonicStats",
+		"PiPredict", "PiRiskAssessment", "PiAssessment", "PiQuantify", "PiModel", "PiHypothesis", "PiExperiment", "PiPrune", "PiCharter", "PiPrompt", "PiStats", "PiMnemonicStats",
 	]) {
 		assert.ok(tools.has(name), `missing tool ${name}`);
 	}
@@ -182,6 +182,18 @@ test("quantitative meta tools return grounded structured output", async () => {
 	const event: any = { messageType: "user", prompt: "xvfb timeout", systemPromptOptions: { sections: {}, cwd: temp, contextFiles: [] } };
 	await handlers.get("before_agent_start")(event, ctx);
 	assert.equal(event.systemPromptOptions.sections["pi-mnemonic-meta"], "");
+});
+
+test("PiStats reports instrumented tool usage when enabled", async () => {
+	const { pi, tools, handlers } = MockPi();
+	PiMnemonic(pi);
+	const ctx: any = { cwd: temp, sessionManager: { getBranch: () => [] }, getContextUsage: () => ({ tokens: 10, contextWindow: 100, percent: 10 }), ui: { notify: () => {}, confirm: async () => true } };
+	await handlers.get("session_start")({ reason: "startup" }, ctx);
+	await tools.get("PiMnemonicSet").execute("1", { Key: "observability.enabled", Value: "true" }, undefined, undefined, ctx);
+	await tools.get("PiMnemonicStats").execute("2", {}, undefined, undefined, ctx);
+	await tools.get("PiMnemonicStats").execute("3", {}, undefined, undefined, ctx);
+	const report = await tools.get("PiStats").execute("4", { Action: "Dump" }, undefined, undefined, ctx);
+	assert.ok(JSON.parse(report.content[0].text).Usage.Total >= 2);
 });
 
 test("technique execution timeout and reserved keys are enforced", async () => {

@@ -31,6 +31,7 @@ export const CAPS = {
 	commands: 200,
 	cold: 200,
 	coldBytes: 1024 * 1024,
+	usage: 2000,
 	hotItems: 5,
 } as const;
 
@@ -92,6 +93,21 @@ export interface Counted extends PinMeta {
 	lastSeenAt: number;
 }
 
+export interface UsageEvent {
+	Id: string;
+	At: number;
+	Tool: string;
+	Action: string;
+	DurationMs: number;
+	Success: boolean;
+	ErrorCode?: string;
+	InputBytes: number;
+	OutputBytes: number;
+	Model?: string;
+	Trigger?: string;
+	Meta?: Record<string, unknown>;
+}
+
 export interface MnemonicState {
 	version: 1;
 	updatedAt: number;
@@ -101,6 +117,7 @@ export interface MnemonicState {
 	techniques: Technique[];
 	paths: Counted[];
 	commands: Counted[];
+	usage: UsageEvent[];
 }
 
 type Scored = { hits: number; createdAt?: number; lastUsedAt?: number; lastSeenAt?: number };
@@ -114,6 +131,7 @@ const DEFAULT_STATE = (): MnemonicState => ({
 	techniques: [],
 	paths: [],
 	commands: [],
+	usage: [],
 });
 
 export function resolveStatePath(): string {
@@ -295,6 +313,7 @@ export class MnemonicStore {
 				techniques: Array.isArray(parsed.techniques) ? parsed.techniques : [],
 				paths: Array.isArray(parsed.paths) ? parsed.paths : [],
 				commands: Array.isArray(parsed.commands) ? parsed.commands : [],
+				usage: Array.isArray(parsed.usage) ? (parsed.usage as UsageEvent[]).slice(-CAPS.usage) : [],
 			};
 		} catch {
 			try {
@@ -328,6 +347,7 @@ export class MnemonicStore {
 		this.state.techniques = trim(this.state.techniques, CAPS.techniques);
 		this.state.paths = trim(this.state.paths, CAPS.paths);
 		this.state.commands = trim(this.state.commands, CAPS.commands);
+		this.state.usage = this.state.usage.slice(-CAPS.usage);
 
 		const entries = Object.entries(this.state.registers);
 		if (entries.length > CAPS.registers) {
@@ -859,6 +879,140 @@ export class MnemonicStore {
 		return { file: this.coldFile, items: cold.length, bytes: JSON.stringify(cold).length, cap: CAPS.cold };
 	}
 
+	RecordUsage(event: Omit<UsageEvent, "Id" | "At"> & { At?: number }): void {
+		this.state.usage.push({
+			Id: id("use"),
+			At: event.At ?? Date.now(),
+			Tool: String(event.Tool || "unknown").slice(0, 80),
+			Action: String(event.Action || "").slice(0, 80),
+			DurationMs: Math.max(0, Number(event.DurationMs) || 0),
+			Success: Boolean(event.Success),
+			ErrorCode: event.ErrorCode ? String(event.ErrorCode).slice(0, 120) : undefined,
+			InputBytes: Math.max(0, Number(event.InputBytes) || 0),
+			OutputBytes: Math.max(0, Number(event.OutputBytes) || 0),
+			Model: event.Model ? String(event.Model).slice(0, 120) : undefined,
+			Trigger: event.Trigger ? String(event.Trigger).slice(0, 240) : undefined,
+			Meta: event.Meta,
+		});
+		this.mark();
+	}
+
+	UsageStats(): Record<string, unknown> {
+		const rows = this.state.usage;
+		const group = (key: (row: UsageEvent) => string) => {
+			const map = new Map<string, UsageEvent[]>();
+			for (const row of rows) {
+				const name = key(row) || "(none)";
+				map.set(name, [...(map.get(name) || []), row]);
+			}
+			return [...map.entries()].map(([Name, items]) => {
+				const durations = items.map((item) => item.DurationMs).sort((a, b) => a - b);
+				return {
+					Name,
+					Calls: items.length,
+					Success: items.filter((item) => item.Success).length,
+					Errors: items.filter((item) => !item.Success).length,
+					AvgMs: Math.round(durations.reduce((a, b) => a + b, 0) / Math.max(1, durations.length)),
+					P95Ms: durations[Math.min(durations.length - 1, Math.floor(durations.length * 0.95))] || 0,
+					InputBytes: items.reduce((a, b) => a + b.InputBytes, 0),
+					OutputBytes: items.reduce((a, b) => a + b.OutputBytes, 0),
+					FirstAt: Math.min(...items.map((item) => item.At)),
+					LastAt: Math.max(...items.map((item) => item.At)),
+				};
+			}).sort((a, b) => b.Calls - a.Calls);
+		};
+		return {
+			Total: rows.length,
+			Cap: CAPS.usage,
+			FirstAt: rows.length ? Math.min(...rows.map((row) => row.At)) : null,
+			LastAt: rows.length ? Math.max(...rows.map((row) => row.At)) : null,
+			ByTool: group((row) => row.Tool),
+			ByAction: group((row) => `${row.Tool}.${row.Action}`),
+			ByModel: group((row) => row.Model || "unknown"),
+			ByTrigger: group((row) => row.Trigger || "none"),
+		};
+	}
+
+	UsageRows(limit = 200): UsageEvent[] {
+		return this.state.usage.slice(-Math.max(1, Math.min(CAPS.usage, limit)));
+	}
+
+	ExportUsage(format: string, limit = 200): unknown {
+		const rows = this.UsageRows(limit);
+		if (format === "jsonl") return rows.map((row) => JSON.stringify(row)).join("\n");
+		if (format === "eval") {
+			return rows.map((row) => ({
+				case_id: row.Id,
+				timestamp: new Date(row.At).toISOString(),
+				tool: row.Tool,
+				action: row.Action,
+				success: row.Success,
+				duration_ms: row.DurationMs,
+				input_bytes: row.InputBytes,
+				output_bytes: row.OutputBytes,
+				model: row.Model,
+				trigger: row.Trigger,
+				metadata: row.Meta || {},
+			}));
+		}
+		if (format === "langsmith") {
+			return rows.map((row) => ({
+				id: row.Id,
+				name: `${row.Tool}.${row.Action || "call"}`,
+				run_type: "tool",
+				start_time: new Date(row.At).toISOString(),
+				end_time: new Date(row.At + row.DurationMs).toISOString(),
+				inputs: { bytes: row.InputBytes, trigger: row.Trigger },
+				outputs: { bytes: row.OutputBytes },
+				extra: { model: row.Model, metadata: row.Meta || {} },
+				tags: [row.Tool, row.Success ? "success" : "error"],
+				error: row.ErrorCode || null,
+			}));
+		}
+		if (format === "langfuse") {
+			return rows.map((row) => ({
+				id: row.Id,
+				name: `${row.Tool}.${row.Action || "call"}`,
+				type: "TOOL",
+				startTime: new Date(row.At).toISOString(),
+				endTime: new Date(row.At + row.DurationMs).toISOString(),
+				input: { bytes: row.InputBytes, trigger: row.Trigger },
+				output: { bytes: row.OutputBytes },
+				metadata: { model: row.Model, success: row.Success, ...(row.Meta || {}) },
+				level: row.Success ? "DEFAULT" : "ERROR",
+				statusMessage: row.ErrorCode || "",
+			}));
+		}
+		if (format === "otel") {
+			return rows.map((row) => ({
+				traceId: createHash("sha256").update(String(row.At)).digest("hex").slice(0, 32),
+				spanId: createHash("sha1").update(row.Id).digest("hex").slice(0, 16),
+				name: `${row.Tool}.${row.Action || "call"}`,
+				kind: 2,
+				startTimeUnixNano: row.At * 1_000_000,
+				endTimeUnixNano: (row.At + row.DurationMs) * 1_000_000,
+				attributes: {
+					"tool.name": row.Tool,
+					"tool.action": row.Action,
+					"tool.success": row.Success,
+					"tool.input_bytes": row.InputBytes,
+					"tool.output_bytes": row.OutputBytes,
+					"gen_ai.model": row.Model || "unknown",
+					"trigger": row.Trigger || "none",
+				},
+				status: { code: row.Success ? 1 : 2, message: row.ErrorCode || "" },
+			}));
+		}
+		return rows;
+	}
+
+	ClearUsage(): number {
+		const count = this.state.usage.length;
+		this.state.usage = [];
+		this.mark();
+		return count;
+	}
+
 	stats(): Record<string, unknown> {
 		return {
 			file: this.filePath,
@@ -869,6 +1023,7 @@ export class MnemonicStore {
 			techniques: this.state.techniques.length,
 			paths: this.state.paths.length,
 			commands: this.state.commands.length,
+			usageRows: this.state.usage.length,
 			dirty: this.dirty,
 		};
 	}

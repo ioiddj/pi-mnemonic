@@ -4,7 +4,7 @@ Bounded working memory for Pi: registers, facts, recent work, reusable technique
 
 ## Install
 
-Cross-platform installers are included:
+Requires Node >=22.19.0 and `pi` on PATH. Cross-platform installers are included:
 
 ```sh
 # POSIX (macOS/Linux/WSL)
@@ -35,11 +35,11 @@ Uninstall:
 node scripts/pi-mnemonic-install.mjs --uninstall
 ```
 
-Uninstall removes the git, npm, and local sources by default.
+Uninstall removes the git, npm, and local sources by default. Use `--npm` or `--local` to remove only one source.
 
 ## Load
 
-Auto-discovered from `~/.pi/agent/extensions/pi-mnemonic/index.ts`. Manual reflection: `/pi-mnemonic-reflect [focus]`. Automatic triggers include matching phrases, every 12 turns, high context usage, repeated tools, and manual/agent calls.
+Installed packages load through the `pi.extensions` manifest. A direct checkout is also auto-discovered from `~/.pi/agent/extensions/pi-mnemonic/index.ts`. Manual reflection: `/pi-mnemonic-reflect [focus]`. Automatic triggers include matching phrases, every 12 turns, high context usage, repeated tools, and manual/agent calls.
 
 Use `/reload` after edits, or smoke-load with:
 
@@ -63,7 +63,7 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 - `PiMnemonicCodify { Kind, Name, Summary, Detail?, Command?, Tags?, Params?, Expose? }` — self-codify as `Register`, `Technique`, `Tool`, `Skill`, or `AgentRule` (appends an interpolated token to global AGENTS.md).
 - `PiMnemonicLink { Action, Path, Depth?, MaxLinks? }` — `Warm` caches markdown link hints; `Weave` appends a bounded `## Related` section to the target `.md` file.
 - `PiAssociate { Action: On|Off|Status|Analyze, Query?, Intelligent? }` — passive session association; Analyze returns structured what-worked/failed/trajectory/outcome/lesson.
-- `PiDream { Action: Run|Status|Promote|Config, Intelligent?, Promote? }` — namespaces the idle miner and can distill structured facts/skills/promotions.
+- `PiDream { Action: Run|Status|Promote|Config, Intelligent?, Promote?, Skill? }` — idle miner; Run distills facts/skills by default, while global promotion requires explicit approval.
 - `PiPlan { Goal, Steps?, Constraints?, Intelligent? }` — stores a plan and optionally returns a structured critique.
 - `PiImagine { Focus?, Limit?, Intelligent? }` — speculative counterfactuals.
 - `PiSimulate { Focus?, Limit?, Intelligent? }` — rigorous counterfactuals with Hypothesis/Experiment/Success.
@@ -75,8 +75,9 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 - `PiExperiment` — bounded experiment design, optionally run via a `PiTechnique`.
 - `PiPrompt { Action: List|Get|Set|Reset, Key?, Prompt? }` — manage editable YAML prompt cards.
 - `PiPrune { Action: Preview|Run|Restore|Status|Config }` — move stale/noisy memory into bounded cold storage, restore it, or configure triggers.
-- `PiCharter { Action: Show|Config|Enable|Disable|Source }` — operating charter with source links; default mode `trigger` fires on sanctions/export-control keywords in the prompt (including incidental mentions); it is prompt guidance, not a compliance determination. `always`, `periodic`, `off` also available.
+- `PiCharter { Action: Show|Config|Enable|Disable|Source }` — operating charter with source links. Default mode is `trigger`: regex/keywords prefilter the prompt, then an optional structured decision can veto. `Enable` without a Mode sets `always`; use `Config { Mode: "trigger" }` for trigger mode. Not a compliance determination.
 - `PiStats { Action: Dump|Enable|Disable|Export|Query|Reset, Format?, Path?, Limit?, SinceMs? }` — opt-in usage telemetry and exports.
+- `PiMemoryCompat { Action: Status|Set, Mode? }` — manage engram coexistence mode.
 - `PiMnemonicStats {}` — counts and caps.
 
 `Expose` creates `PiTechnique<Name>` tools with one string parameter per declared `Params` entry. Generated commands are capped at 30 s and 20 KiB output.
@@ -89,6 +90,8 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 - `/pi-mnemonic-reflect [focus]`
 - `/pi-mnemonic-associate on|off|status`
 - `/pi-mnemonic-stats [json|jsonl|eval|langsmith|langfuse|otel] [path]`
+- `/pi-mnemonic-registers`
+- `/pi-mnemonic-compat [coexist|mnemonic-primary|engram-primary|off]`
 
 ## Register visualization and engram compatibility
 

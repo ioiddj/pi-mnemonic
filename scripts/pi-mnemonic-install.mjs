@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SOURCES = {
   git: "git:github.com/ioiddj/pi-mnemonic",
-  npm: "@ioiddj/pi-mnemonic",
+  npm: "npm:@ioiddj/pi-mnemonic",
   local: REPO_ROOT,
 };
 

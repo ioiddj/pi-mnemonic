@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import type { MnemonicStore } from "./store.ts";
+import { redactCommand } from "./redact.ts";
 
 export interface WarmedLink {
 	Kind: "file" | "url";
@@ -54,14 +55,17 @@ export function WarmMarkdownLinks(
 			const isUrl = /^https?:\/\//i.test(raw);
 			let target = raw;
 			if (!isUrl) {
+				let resolved: string;
 				try {
-					target = path.resolve(path.dirname(current.base), decodeURIComponent(raw.split("#")[0]));
+					resolved = path.resolve(path.dirname(current.base), decodeURIComponent(raw.split("#")[0]));
 				} catch {
 					continue;
 				}
-				if (allowedRoot && !(target === path.resolve(allowedRoot) || target.startsWith(`${path.resolve(allowedRoot)}${path.sep}`))) continue;
 				try {
-					if (fs.lstatSync(target).isSymbolicLink() || !fs.statSync(target).isFile()) continue;
+					const rootReal = allowedRoot ? fs.realpathSync(path.resolve(allowedRoot)) : undefined;
+					target = fs.realpathSync(resolved);
+					if (rootReal && !(target === rootReal || target.startsWith(`${rootReal}${path.sep}`))) continue;
+					if (!fs.statSync(target).isFile() || !/\.md$/i.test(target)) continue;
 				} catch {
 					continue;
 				}
@@ -84,6 +88,7 @@ export function WarmMarkdownLinks(
 					Preview = "Local reference could not be read.";
 				}
 			}
+			Summary = redactCommand(Summary);
 			const Key = slug(target);
 			store.set(Key, { Kind: isUrl ? "url" : "file", Target: target, Label, Summary, Preview }, ["md-link", isUrl ? "url" : "file"]);
 			warmed.push({ Kind: isUrl ? "url" : "file", Target: target, Label, Summary, Preview, Key });
@@ -98,10 +103,12 @@ export function WarmMarkdownLinks(
 
 export function WeaveRelatedLinks(markdownPath: string, maxLinks = 10, allowedRoot?: string): { file: string; added: string[] } {
 	const resolved = path.resolve(markdownPath);
-	if (allowedRoot && !(resolved === path.resolve(allowedRoot) || resolved.startsWith(`${path.resolve(allowedRoot)}${path.sep}`))) throw new Error("Markdown file is outside the allowed root.");
-	if (fs.lstatSync(resolved).isSymbolicLink()) throw new Error("Refusing to weave a symlinked file.");
+	const rootReal = allowedRoot ? fs.realpathSync(path.resolve(allowedRoot)) : undefined;
+	const resolvedReal = fs.realpathSync(resolved);
+	if (rootReal && !(resolvedReal === rootReal || resolvedReal.startsWith(`${rootReal}${path.sep}`))) throw new Error("Markdown file is outside the allowed root.");
+	if (fs.lstatSync(resolvedReal).isSymbolicLink()) throw new Error("Refusing to weave a symlinked file.");
 	if (!/\.md$/i.test(resolved)) throw new Error("PiMnemonicLink Weave requires a markdown file.");
-	const stat = fs.statSync(resolved);
+	const stat = fs.statSync(resolvedReal);
 	if (!stat.isFile() || stat.size > 200_000) throw new Error("Markdown file is not a readable bounded file.");
 	const fd = fs.openSync(resolved, "r");
 	const buffer = Buffer.alloc(stat.size);
@@ -110,7 +117,7 @@ export function WeaveRelatedLinks(markdownPath: string, maxLinks = 10, allowedRo
 	const text = buffer.slice(0, read).toString("utf8");
 	const dir = path.dirname(resolved);
 	const siblings = fs.readdirSync(dir)
-		.filter((name) => /\.md$/i.test(name) && path.join(dir, name) !== resolved)
+		.filter((name) => /\.md$/i.test(name) && path.join(dir, name) !== resolvedReal)
 		.slice(0, Math.max(1, Math.min(20, maxLinks)));
 	const existing = new Set([...text.matchAll(/\]\(([^)]+)\)/g)].map((m) => m[1]));
 	const added = siblings
@@ -119,9 +126,9 @@ export function WeaveRelatedLinks(markdownPath: string, maxLinks = 10, allowedRo
 			const label = name.replace(/\.md$/i, "").replace(/[\][()\r\n]/g, " ").slice(0, 80);
 			return `- [${label}](${encodeURIComponent(name)})`;
 		});
-	if (!added.length) return { file: resolved, added };
+	if (!added.length) return { file: resolvedReal, added };
 	const section = `\n\n## Related\n\n${added.join("\n")}\n`;
-	if (text.length + section.length > 150_000) return { file: resolved, added: [] };
-	fs.appendFileSync(resolved, section, { mode: 0o600 });
-	return { file: resolved, added };
+	if (text.length + section.length > 150_000) return { file: resolvedReal, added: [] };
+	fs.appendFileSync(resolvedReal, section, { mode: 0o600 });
+	return { file: resolvedReal, added };
 }

@@ -18,11 +18,11 @@ test("installer defaults to git source", () => {
 });
 
 test("installer supports npm, local, project scope, and uninstall", () => {
-	assert.match(run(["--npm"]).stdout, /\$ pi install @ioiddj\/pi-mnemonic/);
+	assert.match(run(["--npm"]).stdout, /\$ pi install npm:@ioiddj\/pi-mnemonic/);
 	assert.match(run(["--local"]).stdout, /\$ pi install .*pi-mnemonic/);
 	assert.match(run(["--project"]).stdout, /-l/);
 	const uninstall = run(["--uninstall"]);
 	assert.equal(uninstall.status, 0);
 	assert.match(uninstall.stdout, /\$ pi remove git:github\.com\/ioiddj\/pi-mnemonic/);
-	assert.match(uninstall.stdout, /\$ pi remove @ioiddj\/pi-mnemonic/);
+	assert.match(uninstall.stdout, /\$ pi remove npm:@ioiddj\/pi-mnemonic/);
 });

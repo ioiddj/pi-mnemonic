@@ -908,7 +908,7 @@ export class MnemonicStore {
 			OutputBytes: Math.max(0, Number(event.OutputBytes) || 0),
 			Model: event.Model ? String(event.Model).slice(0, 120) : undefined,
 			Trigger: event.Trigger ? String(event.Trigger).slice(0, 240) : undefined,
-			Meta: event.Meta,
+			Meta: event.Meta ? JSON.parse(JSON.stringify(event.Meta)) as Record<string, unknown> : undefined,
 		});
 		this.mark();
 	}

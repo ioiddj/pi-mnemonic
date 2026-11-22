@@ -1,3 +1,4 @@
+import { redactCommand } from "./redact.ts";
 import { CAPS, type MnemonicStore } from "./store.ts";
 
 const SECTION = "pi-mnemonic";
@@ -82,7 +83,7 @@ export function BuildLinkHints(store: MnemonicStore, maxChars = 1500): string {
 			const value = row.value as Record<string, unknown> | undefined;
 			const Summary = typeof value?.Summary === "string" ? value.Summary : String(row.preview || "");
 			const Target = typeof value?.Target === "string" ? value.Target : String(row.key);
-			return `- ${row.key}: ${Summary.slice(0, 140)} (${Target.slice(0, 160)})`;
+			return `- ${row.key}: ${redactCommand(Summary).slice(0, 140)} (${redactCommand(Target).slice(0, 160)})`;
 		});
 	if (!links.length) return "";
 	const text = ["Warmed markdown references (open with read/fetch when useful):", ...links].join("\n");

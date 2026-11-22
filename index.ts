@@ -26,8 +26,24 @@ type AnyRecord = Record<string, unknown>;
 
 const CHARTER_SOURCES = path.join(path.dirname(fileURLToPath(import.meta.url)), ".config", "charter", "SOURCES.md");
 
+function ExportTarget(raw: string): string {
+	const root = path.resolve(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "pi-mnemonic", "exports");
+	const target = path.resolve(raw.replace(/^@/, ""));
+	if (!(target === root || target.startsWith(`${root}${path.sep}`))) throw new MnemonicError("Export path must be inside the pi-mnemonic export directory.", `Use a path under ${root}.`);
+	try {
+		if (fs.existsSync(target) || fs.lstatSync(target).isSymbolicLink()) throw new Error("exists");
+	} catch (error) {
+		if (error instanceof MnemonicError) throw error;
+	}
+	return target;
+}
+
+function WriteExport(file: string, text: string): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+	fs.writeFileSync(file, text, { mode: 0o600, flag: "wx" });
+}
+
 async function OperatorConfirm(ctx: any, label: string): Promise<boolean> {
-	if (process.env.PI_MNEMONIC_ALLOW_OPERATOR_WRITES === "1") return true;
 	if (typeof ctx?.ui?.confirm !== "function") return false;
 	try {
 		return Boolean(await ctx.ui.confirm(label, "This changes operator-controlled configuration."));
@@ -120,6 +136,9 @@ function SkillName(name: string): string {
 }
 
 function WriteSkillFile(name: string, summary: string, detail: string, command: string | undefined, tags: string[]): string {
+	summary = summary.slice(0, 500);
+	detail = detail.slice(0, 4000);
+	command = command ? command.slice(0, 4000) : undefined;
 	const slug = SkillName(name);
 	const dir = path.join(ResolveSkillsDir(), slug);
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -139,8 +158,9 @@ function WriteSkillFile(name: string, summary: string, detail: string, command: 
 	].join("\n");
 	if (fs.existsSync(skillFile)) {
 		const existing = fs.readFileSync(skillFile, "utf8");
-		if (existing.length > 100_000) throw new MnemonicError(`Skill ${slug} is too large to append.`, "Edit the SKILL.md manually or choose a new Name.");
-		fs.appendFileSync(skillFile, `\n\n## Update ${new Date().toISOString()}\n\n${summary}\n\n${detail}\n`, { mode: 0o600 });
+		const addition = `\n\n## Update ${new Date().toISOString()}\n\n${summary}\n\n${detail}\n`;
+		if (existing.length + addition.length > 100_000) throw new MnemonicError(`Skill ${slug} is too large to append.`, "Edit the SKILL.md manually or choose a new Name.");
+		fs.appendFileSync(skillFile, addition, { mode: 0o600 });
 	} else {
 		fs.writeFileSync(skillFile, body, { mode: 0o600 });
 	}
@@ -224,7 +244,7 @@ function HelpText(): string {
 		"PiPrune { Action: Preview|Run|Restore|Status|Config, Key?, Focus?, Reason?, Intelligent? } — move unused/noisy memory into cold storage; supports manual, agent, regex/keyword/code, and typed decision triggers.",
 		"PiMemoryCompat { Action: Status|Set, Mode? } — manage coexistence with engram (coexist/mnemonic-primary/engram-primary/off).",
 		"PiStats { Action: Dump|Enable|Disable|Export|Query|Reset, Format?, Path?, Limit?, SinceMs? } — opt-in usage telemetry and exports to JSON/JSONL/eval/LangSmith/Langfuse/OTel.",
-		"PiCharter { Action: Show|Config|Enable|Disable|Source, Mode?, EveryNTurns? } — operating charter with source links; default trigger mode fires only for sanctioned-party or sanctions/export-control work (modes always/trigger/periodic/off).",
+		"PiCharter { Action: Show|Config|Enable|Disable|Source, Mode?, EveryNTurns? } — operating charter with source links; default trigger uses regex/keywords plus optional structured veto; Enable without Mode sets always (modes always/trigger/periodic/off).",
 		"Pin syntax in markdown: {{key!important}}, {{key#alwayson}}, {{key//remember}} pin a register/fact/episode/technique so pruning skips it. Source index: .config/charter/SOURCES.md.",
 		"Repeated PiAssociate signals can promote cold items back into active memory when associate.promoteThreshold hits (default 5).",
 		"Set meta.auto=true via PiMnemonicSet to enable deterministic quantitative tripwire context when usage >=80% or a tool repeats >=5 times.",
@@ -262,11 +282,10 @@ async function RunCommand(command: string, cwd: string | undefined, timeoutMs: n
 	};
 
 	return new Promise((resolve, reject) => {
-		const child = spawn("/bin/sh", ["-c", command], {
-			cwd: cwd || process.cwd(),
-			stdio: ["ignore", "pipe", "pipe"],
-			detached: true,
-		});
+		const isWindows = process.platform === "win32";
+		const child = isWindows
+			? spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], { cwd: cwd || process.cwd(), stdio: ["ignore", "pipe", "pipe"] })
+			: spawn("/bin/sh", ["-c", command], { cwd: cwd || process.cwd(), stdio: ["ignore", "pipe", "pipe"], detached: true });
 		let settled = false;
 		let timer: NodeJS.Timeout | undefined;
 		let onAbort: (() => void) | undefined;
@@ -280,15 +299,19 @@ async function RunCommand(command: string, cwd: string | undefined, timeoutMs: n
 			cleanup();
 			action();
 		};
-		const killGroup = (reason: "timeout" | "abort") => {
-			try {
-				if (child.pid) process.kill(-child.pid, "SIGKILL");
-			} catch {
-				try { child.kill("SIGKILL"); } catch { /* already gone */ }
+		const killGroup = (_reason: "timeout" | "abort") => {
+			if (isWindows) {
+				try { child.kill(); } catch { /* already gone */ }
+			} else {
+				try {
+					if (child.pid) process.kill(-child.pid, "SIGKILL");
+				} catch {
+					try { child.kill("SIGKILL"); } catch { /* already gone */ }
+				}
 			}
 			child.stdout.destroy();
 			child.stderr.destroy();
-			finish(() => reason === "abort"
+			finish(() => _reason === "abort"
 				? reject(new DOMException("Aborted", "AbortError"))
 				: resolve({ code: null, stdout, stderr, truncated: true, command, timedOut: true }));
 		};
@@ -483,6 +506,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	let transientPrompt = "";
 	let transientResponse = "";
 	let transientAt = 0;
+	const registeredToolNames = new Set<string>();
+	const toolStartArgs = new Map<string, unknown>();
 	const generatedTools = new Map<string, string>();
 
 	const GetStore = (): MnemonicStore => {
@@ -532,6 +557,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		Flush();
 	};
 	const RegisterTool = (definition: AnyRecord) => {
+		registeredToolNames.add(String(definition.name));
 		pi.registerTool({
 			...(definition as any),
 			execute: async (toolCallId: string, params: AnyRecord, signal: AbortSignal | undefined, onUpdate: unknown, ctx: any) => {
@@ -548,6 +574,22 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		});
 	};
 
+
+	const ReconcileTechniqueTools = () => {
+		const current = GetStore();
+		const desired = new Set(current.allTechniques().filter((technique) => technique.expose).slice(0, CAPS.dynamicTools).map((technique) => technique.id));
+		for (const [id, name] of [...generatedTools.entries()]) {
+			if (desired.has(id)) continue;
+			generatedTools.delete(id);
+			try {
+				const active = pi.getActiveTools?.() || [];
+				pi.setActiveTools?.(active.filter((tool) => tool !== name));
+			} catch {
+				// Tool deactivation is best-effort; the name remains available after restart.
+			}
+		}
+		RegisterTechniqueTools();
+	};
 
 	const StoreVariables = (): AnyRecord => {
 		const context: AnyRecord = {};
@@ -574,7 +616,9 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	const ShellQuote = (value: unknown): string => {
 		const text = value === undefined || value === null ? "" : String(value);
 		if (/[\0\r\n]/.test(text)) throw new MnemonicError("Technique parameters cannot contain newlines or NUL bytes.", "Pass a single-line value or use a file path/register key.");
-		return `'${text.replace(/'/g, `'\\''`)}'`;
+		return process.platform === "win32"
+			? `"${text.replace(/"/g, `""`).replace(/%/g, "%%")}"`
+			: `'${text.replace(/'/g, `'\\''`)}'`;
 	};
 	const RenderTechnique = (template: string, vars: AnyRecord = {}): string => {
 		const quoted = Object.fromEntries(Object.entries(vars).map(([key, value]) => [key, ShellQuote(value)]));
@@ -612,7 +656,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}
 	};
 
-	const DreamRun = async (ctx: any, promote = false, force = false, aborted = false) => {
+	const DreamRun = async (ctx: any, promote = false, force = false, aborted = false, promoteApproved = false, skillApproved = false) => {
 		if (shuttingDown || aborted || ctx?.signal?.aborted) return { processed: 0, promoted: [] as string[], skipped: true };
 		if (dreamingActive) return { processed: 0, promoted: [] as string[], skipped: true };
 		if (!HasHeadroom() || (!force && (ctx?.isIdle?.() === false || ctx?.hasPendingMessages?.()))) return { processed: 0, promoted: [] as string[], skipped: true };
@@ -629,13 +673,15 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			: BACKGROUND_MAX_SESSIONS;
 		for (const file of SessionFiles(sessionLimit)) {
 			if (shuttingDown || aborted || ctx?.signal?.aborted) break;
-			if (file === process.env.PI_SESSION_FILE || set.has(file)) continue;
+			const sm = ctx?.sessionManager as AnyRecord | undefined;
+			const liveFile = String(sm && typeof sm.getSessionFile === "function" ? (sm.getSessionFile as () => string)() : (process.env.PI_SESSION_FILE || ""));
+			if (file === liveFile || set.has(file)) continue;
 			if (!HasHeadroom()) break;
 			try {
 				const knowledge = ExtractSessionKnowledge(file);
 				for (const claim of knowledge.facts) current.learn(claim, ["session-mined"], 0.6, file);
 				if (knowledge.episode) current.note(knowledge.episode, `Mined from ${path.basename(file)}`, ["session-mined"]);
-				for (const skill of knowledge.skills) WriteSkillFile(skill.name, skill.summary, `Mined from ${path.basename(file)}.`, undefined, ["session-mined"]);
+				if (skillApproved) if (skillApproved) for (const skill of knowledge.skills) WriteSkillFile(skill.name, skill.summary, `Mined from ${path.basename(file)}.`, undefined, ["session-mined"]);
 				set.add(file);
 				processed += 1;
 			} catch {
@@ -643,7 +689,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			}
 			await new Promise((resolve) => setImmediate(resolve));
 		}
-		const promoted = promote ? PromoteFacts(current, 2) : [];
+		const promoted = promote && promoteApproved ? PromoteFacts(current, 2) : [];
 		if (processed || promoted.length || force) {
 			if (processed) current.set("background.indexed", [...set].slice(-200), ["background"]);
 			current.set("dream.lastRun", { at: Date.now(), processed, promoted }, ["dream"]);
@@ -823,6 +869,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 					const removed = current.techniqueDelete(name);
 					if (deleted) generatedTools.delete(deleted.id);
 					Flush();
+					ReconcileTechniqueTools();
 					return Result(removed ? `Deleted ${name}` : `No technique ${name}`, { removed });
 				}
 				case "Hit": {
@@ -986,7 +1033,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	});
 
 	const EvidenceFromStore = (focus: string, limit = 8): Evidence[] => GetStore().Recall(focus, limit) as Evidence[];
-	const MetaStructured = async (ctx: any, system: string, prompt: string, fallback: Record<string, unknown>, schema: any, _requiredKey: string, signal?: AbortSignal) => {
+	const MetaStructured = async (ctx: any, system: string, prompt: string, fallback: Record<string, unknown>, schema: any, _requiredKey: string, signal?: AbortSignal, enabled = true) => {
+		if (!enabled) return fallback;
 		const structured = await PromptStructured(ctx, system, prompt, 900, signal);
 		if (!structured) return fallback;
 		const merged = { ...fallback, ...structured };
@@ -1107,6 +1155,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			Action: StringEnum(["Run", "Status", "Promote", "Config"] as const),
 			MaxSessions: Type.Optional(Type.Number()),
 			Promote: Type.Optional(Type.Boolean()),
+			Skill: Type.Optional(Type.Boolean()),
 			Intelligent: Type.Optional(Type.Boolean()),
 		}),
 		execute: Execute(async (params: AnyRecord, signal?: AbortSignal, ctx?: any) => {
@@ -1117,7 +1166,9 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				Flush();
 			}
 			if (action === "Run") {
-				const result = await DreamRun(ctx, params.Promote !== false, true);
+				const promoteApproved = params.Promote === true ? await OperatorConfirm(ctx, "Allow promoting rules to global AGENTS.md?") : false;
+				const skillApproved = params.Skill === true ? await OperatorConfirm(ctx, "Allow writing mined skills?") : false;
+				const result = await DreamRun(ctx, params.Promote === true, true, false, promoteApproved, skillApproved);
 				let distilled: Record<string, unknown> | undefined;
 				if (params.Intelligent !== false) {
 					const candidates = current.Recall("root cause verified fix failure environment operator trajectory", 12);
@@ -1148,10 +1199,12 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				return Result(promoted.length ? `Promoted ${promoted.join(", ")}` : "No high-confidence facts were promoted.", { promoted });
 			}
 			if (action === "Config") {
-				if (params.Promote !== undefined && !(await OperatorConfirm(ctx, "Allow changing dream auto-promotion?"))) throw new MnemonicError("Operator confirmation required.", "This is an operator-controlled safety setting.");
-				current.set("dream.autoPromote", params.Promote === true, ["dream"]);
-				Flush();
-				return Result(JSON.stringify(current.peek("dream.lastRun") || { autoPromote: params.Promote !== false }));
+				if (params.Promote !== undefined) {
+					if (!(await OperatorConfirm(ctx, "Allow changing dream auto-promotion?"))) throw new MnemonicError("Operator confirmation required.", "This is an operator-controlled safety setting.");
+					current.set("dream.autoPromote", params.Promote === true, ["dream"]);
+					Flush();
+				}
+				return Result(JSON.stringify({ autoPromote: current.peek("dream.autoPromote") === true, autoSkill: current.peek("dream.autoSkill") === true }));
 			}
 			return Result(JSON.stringify(current.peek("dream.lastRun") || { status: "no run yet" }));
 		}),
@@ -1294,7 +1347,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current trajectory");
 			const evidence = EvidenceFromStore(focus);
 			const fallback = Predict(focus, evidence) as unknown as Record<string, unknown>;
-			const result = await MetaStructured(ctx, PromptText("PiPredict"), `Focus: ${focus}\nHorizon: ${params.Horizon || "short"}\nEvidence: ${JSON.stringify(evidence)}`, fallback, PredictionStructuredSchema, "Forecast", signal);
+			const result = await MetaStructured(ctx, PromptText("PiPredict"), `Focus: ${focus}\nHorizon: ${params.Horizon || "short"}\nEvidence: ${JSON.stringify(evidence)}`, fallback, PredictionStructuredSchema, "Forecast", signal, params.Intelligent !== false);
 			MetaRemember(`Prediction: ${String(result.Forecast).slice(0, 160)}`, JSON.stringify(result).slice(0, 4000), ["prediction", "meta"]);
 			return Result(JSON.stringify(result, null, 2), result, result);
 		}),
@@ -1304,7 +1357,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current trajectory");
 		const evidence = EvidenceFromStore(focus);
 		const fallback = AssessRisk(focus, evidence, ctx?.getContextUsage?.()?.percent ?? null, Number(GetStore().peek("reflect.toolRepeats") ?? 0)) as unknown as Record<string, unknown>;
-		const result = await MetaStructured(ctx, PromptText("PiRiskAssessment"), `Focus: ${focus}\nEvidence: ${JSON.stringify(evidence)}`, fallback, RiskStructuredSchema, "Recommendation", signal);
+		const result = await MetaStructured(ctx, PromptText("PiRiskAssessment"), `Focus: ${focus}\nEvidence: ${JSON.stringify(evidence)}`, fallback, RiskStructuredSchema, "Recommendation", signal, params.Intelligent !== false);
 		MetaRemember(`Risk assessment: ${String(result.Recommendation).slice(0, 160)}`, JSON.stringify(result).slice(0, 4000), ["risk", "meta"]);
 		return Result(JSON.stringify(result, null, 2), result, result);
 	});
@@ -1331,7 +1384,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current trajectory");
 		const evidence = EvidenceFromStore(focus);
 		const fallback = Quantify(focus, evidence, ctx?.getContextUsage?.()?.percent ?? null, Number(GetStore().peek("reflect.toolRepeats") ?? 0)) as unknown as Record<string, unknown>;
-		const result = await MetaStructured(ctx, PromptText("PiQuantify"), `Focus: ${focus}\nMetric: ${String(params.Metric || "")}\nEvidence: ${JSON.stringify(evidence)}`, fallback, QuantStructuredSchema, "Formula", signal);
+		const result = await MetaStructured(ctx, PromptText("PiQuantify"), `Focus: ${focus}\nMetric: ${String(params.Metric || "")}\nEvidence: ${JSON.stringify(evidence)}`, fallback, QuantStructuredSchema, "Formula", signal, params.Intelligent !== false);
 		MetaRemember(`Quant model: ${focus}`, JSON.stringify(result).slice(0, 4000), ["model", "meta"]);
 		return Result(JSON.stringify(result, null, 2), result, result);
 	});
@@ -1365,7 +1418,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			const evidence = EvidenceFromStore(focus);
 			const fallback = Hypothesize(focus, evidence) as unknown as Record<string, unknown>;
 			if (params.Claim) fallback.Claim = String(params.Claim).slice(0, 400);
-			const result = await MetaStructured(ctx, PromptText("PiHypothesis"), `Focus: ${focus}\nClaim: ${String(params.Claim || "")}\nEvidence: ${JSON.stringify(evidence)}`, fallback, HypothesisStructuredSchema, "Null", signal);
+			const result = await MetaStructured(ctx, PromptText("PiHypothesis"), `Focus: ${focus}\nClaim: ${String(params.Claim || "")}\nEvidence: ${JSON.stringify(evidence)}`, fallback, HypothesisStructuredSchema, "Null", signal, params.Intelligent !== false);
 			MetaRemember(`Hypothesis: ${String(result.Claim).slice(0, 160)}`, JSON.stringify(result).slice(0, 4000), ["hypothesis", "meta"]);
 			return Result(JSON.stringify(result, null, 2), result, result);
 		}),
@@ -1384,7 +1437,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			const focus = String(params.Focus || GetStore().peek("associate.lastPrompt") || "Current assumption");
 			const hypothesis = String(params.Hypothesis || GetStore().peek("reflect.lastGuidance") || `Changing ${focus} may improve the outcome.`);
 			const fallback = DesignExperiment(focus, hypothesis, String(params.TechniqueName || "")) as unknown as Record<string, unknown>;
-			const result = await MetaStructured(ctx, PromptText("PiExperiment"), `Focus: ${focus}\nHypothesis: ${hypothesis}\nTemplate: ${JSON.stringify(fallback)}`, fallback, ExperimentStructuredSchema, "Steps", signal);
+			const result = await MetaStructured(ctx, PromptText("PiExperiment"), `Focus: ${focus}\nHypothesis: ${hypothesis}\nTemplate: ${JSON.stringify(fallback)}`, fallback, ExperimentStructuredSchema, "Steps", signal, params.Intelligent !== false);
 			if (params.Run && params.TechniqueName) {
 				const technique = GetStore().techniquePeek(String(params.TechniqueName));
 				if (!technique) throw new MnemonicError(`No technique '${params.TechniqueName}'.`, "Add a PiTechnique first or omit Run.");
@@ -1446,7 +1499,6 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		promptSnippet: "Take a step back and decide whether to continue, scope, reset, plan, or exit",
 		promptGuidelines: ["Use PiReflect for a sanity check when work circles, context grows, or priorities and privacy risks need re-evaluation."],
 		parameters: ReflectParams,
-		outputSchema: ReflectStructuredSchema,
 		execute: ReflectExecute,
 	});
 
@@ -1455,7 +1507,6 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		label: "Pi Observe",
 		description: "Alias of PiReflect: observe the current trajectory and inject structured next-turn steering.",
 		parameters: ReflectParams,
-		outputSchema: ReflectStructuredSchema,
 		execute: ReflectExecute,
 	});
 
@@ -1567,8 +1618,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			let decisions: Record<string, "Prune" | "Keep"> | null = null;
 			if (params.Intelligent !== false && candidates.length) {
 				const decision = await PromptStructured(ctx, PromptText("PiTriggerDecision"), JSON.stringify({ Focus: focus, Reasons: trigger.Reasons, CandidateCount: candidates.length }), 300, signal);
-				const decisionFire = decision?.Fire === true || decision?.Priority === "Fire";
-				if (decisionFire === false || decision?.Priority === "Skip") return Result(JSON.stringify({ skipped: true, reason: (decision as AnyRecord | undefined)?.Reason || "Decision model Skip" }, null, 2));
+				const decisionFire = decision ? (decision.Fire === true || decision.Priority === "Fire") : true;
+				if ((decision && decision.Fire === false) || decision?.Priority === "Skip" || decision?.Priority === "Defer") return Result(JSON.stringify({ skipped: true, reason: (decision as AnyRecord | undefined)?.Reason || "Decision model Skip" }, null, 2));
 				const structured = await PromptStructured(ctx, PromptText("PiPruneDecision"), JSON.stringify({ Focus: focus, Candidates: candidates.slice(0, 20) }), 600, signal);
 				if (!Array.isArray(structured?.Decisions)) return Result(JSON.stringify({ skipped: true, reason: "Prune decision model returned no valid Decisions; nothing was moved." }, null, 2), { error: true, skipped: true });
 				decisions = {};
@@ -1669,13 +1720,12 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			}
 			if (action === "Export") {
 				const format = String(params.Format || "json");
-				if (params.Path && !(await OperatorConfirm(ctx, "Allow writing usage export to disk?"))) throw new MnemonicError("Operator confirmation required.", "Exports can contain operational metadata.");
+				const file = params.Path ? ExportTarget(String(params.Path)) : undefined;
+				if (file && !(await OperatorConfirm(ctx, `Allow writing usage export to ${file}?`))) throw new MnemonicError("Operator confirmation required.", "Exports can contain operational metadata.");
 				const data = current.ExportUsage(format, limit);
 				const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
-				if (params.Path) {
-					const file = path.resolve(String(params.Path).replace(/^@/, ""));
-					fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-					fs.writeFileSync(file, text, { mode: 0o600 });
+				if (file) {
+					WriteExport(file, text);
 					return Result(`Exported ${format} to ${file}`, { file, format, rows: Array.isArray(data) ? data.length : 1 });
 				}
 				return Result(text, { format, data });
@@ -1710,8 +1760,8 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			// A compact snapshot is an optimization; a fresh store is still valid.
 		}
 		store.pathHit(ctx.cwd);
-		store.flush();
-		RegisterTechniqueTools();
+		Flush();
+		ReconcileTechniqueTools();
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -1732,9 +1782,14 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			event.systemPromptOptions.sections["pi-mnemonic-compat"] = "";
 		}
 		event.systemPromptOptions.sections[ContextSectionName()] = BuildContext(current, 4000);
+		const customContent = ((event as unknown as AnyRecord).message as AnyRecord | undefined)?.content;
 		const promptText = event.messageType === "user"
 			? event.prompt
-			: (typeof (event.message as unknown as AnyRecord)?.content === "string" ? String((event.message as unknown as AnyRecord).content) : "");
+			: typeof customContent === "string"
+				? customContent
+				: Array.isArray(customContent)
+					? customContent.filter((part: any) => part?.type === "text").map((part: any) => String(part.text || "")).join("\n")
+					: "";
 		event.systemPromptOptions.sections[RecallSectionName()] = BuildAssociations(current, promptText, 1200);
 		if (current.peek("associate.enabled") !== false) {
 			transientPrompt = promptText.slice(0, 1200); transientAt = Date.now();
@@ -1826,6 +1881,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 					? `Moved ${moved.length} stale/noisy items to cold storage (${pruneTrigger.Reasons.slice(0, 3).join("; ")}). Restore with PiPrune Restore Key.`
 					: "Prune trigger fired but no stale items qualified.";
 				Flush();
+				ReconcileTechniqueTools();
 			} else {
 				event.systemPromptOptions.sections["pi-mnemonic-prune"] = "";
 			}
@@ -1888,16 +1944,28 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		pi.appendEntry("pi-mnemonic-compact", current.compactSnapshot());
 	});
 
+	pi.on("tool_execution_start", async (event) => {
+		const raw = event as unknown as AnyRecord;
+		if (!raw.toolCallId) return;
+		if (toolStartArgs.size >= 200) toolStartArgs.delete(toolStartArgs.keys().next().value as string);
+		toolStartArgs.set(String(raw.toolCallId), raw.args ?? raw.input);
+	});
+
 	pi.on("tool_execution_end", async (event, ctx) => {
 		if (!ObserveEnabled()) return;
 		const raw = event as unknown as AnyRecord;
+		const toolName = String(raw.toolName || "builtin");
+		if (registeredToolNames.has(toolName)) return;
+		const callId = String(raw.toolCallId || "");
+		const input = toolStartArgs.get(callId);
+		toolStartArgs.delete(callId);
 		GetStore().RecordUsage({
-			Tool: String(raw.toolName || "builtin"),
+			Tool: toolName,
 			Action: "execute",
 			DurationMs: Number(raw.durationMs) || 0,
 			Success: !raw.isError,
-			ErrorCode: raw.error ? String((raw.error as AnyRecord)?.name || "error") : undefined,
-			InputBytes: ByteCount(raw.input),
+			ErrorCode: raw.isError ? "tool_error" : undefined,
+			InputBytes: ByteCount(input),
 			OutputBytes: ByteCount(raw.result),
 			Model: String(ctx?.model?.id || ""),
 			Meta: { source: "tool_execution_end" },
@@ -1933,6 +2001,9 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			const repeats = name && name === lastTool ? Number(current.peek("reflect.toolRepeats") ?? 0) + 1 : 1;
 			current.set("reflect.lastTool", name, ["reflect"]);
 			current.set("reflect.toolRepeats", repeats, ["reflect"]);
+		} else {
+			current.set("reflect.lastTool", "", ["reflect"]);
+			current.set("reflect.toolRepeats", 0, ["reflect"]);
 		}
 		Flush();
 	});
@@ -1940,7 +2011,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	pi.on("agent_settled", async (event, ctx) => {
 		if ((event as unknown as AnyRecord).aborted) return;
 		if (["off", "engram-primary"].includes(CompatMode())) return;
-		await DreamRun(ctx, GetStore().peek("dream.autoPromote") === true);
+		await DreamRun(ctx, GetStore().peek("dream.autoPromote") === true, false, false, GetStore().peek("dream.autoPromote") === true, GetStore().peek("dream.autoSkill") === true);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -1997,14 +2068,13 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				ctx.ui.notify(`Usage recording ${arg}d.`, "info");
 				return;
 			}
-			if (arg && outPath && !(await OperatorConfirm(ctx, "Allow writing usage export to disk?"))) return;
+			const exportFile = outPath ? ExportTarget(outPath) : undefined;
+			if (exportFile && !(await OperatorConfirm(ctx, `Allow writing usage export to ${exportFile}?`))) return;
 			const data = current.ExportUsage(arg || "json", 200);
 			const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
-			if (outPath) {
-				const file = path.resolve(outPath.replace(/^@/, ""));
-				fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-				fs.writeFileSync(file, text, { mode: 0o600 });
-				ctx.ui.notify(`Exported to ${file}`, "info");
+			if (exportFile) {
+				WriteExport(exportFile, text);
+				ctx.ui.notify(`Exported to ${exportFile}`, "info");
 				return;
 			}
 			ctx.ui.notify(`Usage rows: ${Number(current.stats().usageRows)}; stats dumped to session.`, "info");

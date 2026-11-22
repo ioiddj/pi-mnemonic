@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.4.1] - 2026-11-22
+
+- Polish pass: deterministic fallback fixes for pruning/model calls, telemetry de-duplication, repeat counters, idle miner session detection, Dream confirmations, generated-tool reconciliation, cross-platform technique execution, safe exports, hardened link resolution, real Pi keybinding IDs, and corrected installer npm source.
+
 ## [0.4.0] - 2026-11-22
 
 - Added `/pi-mnemonic-registers` themed TUI overlay for local memory inspection.

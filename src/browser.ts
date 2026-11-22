@@ -122,7 +122,9 @@ export function CreateRegisterBrowser(
 		store.flush();
 		tui.requestRender();
 	};
-	const matches = (data: string, action: string) => Boolean(keybindings?.matches?.(data, action) || matchesKey(data, action as any));
+	const matches = (data: string, semantic: string, fallback: string) => Boolean(
+		keybindings?.matches?.(data, semantic) || matchesKey(data, fallback as any),
+	);
 	return {
 		render(width: number): string[] {
 			if (cachedLines && cachedWidth === width) return cachedLines;
@@ -131,11 +133,11 @@ export function CreateRegisterBrowser(
 			return cachedLines;
 		},
 		handleInput(data: string): void {
-			if (matches(data, "escape") || matches(data, "ctrl+c")) return done();
-			if (matches(data, "up")) scrollOffset = Math.max(0, scrollOffset - 1);
-			else if (matches(data, "down")) scrollOffset += 1;
-			else if (matches(data, "pageUp")) scrollOffset = Math.max(0, scrollOffset - VIEWPORT);
-			else if (matches(data, "pageDown")) scrollOffset += VIEWPORT;
+			if (matches(data, "tui.select.cancel", "escape") || matches(data, "tui.select.cancel", "ctrl+c")) return done();
+			if (matches(data, "tui.select.up", "up")) scrollOffset = Math.max(0, scrollOffset - 1);
+			else if (matches(data, "tui.select.down", "down")) scrollOffset += 1;
+			else if (matches(data, "tui.select.pageUp", "pageUp")) scrollOffset = Math.max(0, scrollOffset - VIEWPORT);
+			else if (matches(data, "tui.select.pageDown", "pageDown")) scrollOffset += VIEWPORT;
 			else if (data === "r" || data === "R") return refresh();
 			else {
 				const n = Number(data);

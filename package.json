@@ -1,6 +1,6 @@
 {
   "name": "@ioiddj/pi-mnemonic",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": false,
   "type": "module",
   "description": "Bounded working memory, associative recall, metacognition tools, and editable prompt cards for Pi coding agents",
@@ -71,7 +71,8 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
-    "typebox": "*"
+    "typebox": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

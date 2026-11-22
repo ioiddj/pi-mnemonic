@@ -879,6 +879,22 @@ export class MnemonicStore {
 		return { file: this.coldFile, items: cold.length, bytes: JSON.stringify(cold).length, cap: CAPS.cold };
 	}
 
+	ListFacts(limit = 12): Array<Record<string, unknown>> {
+		return [...this.state.facts].sort((a, b) => score(b) - score(a)).slice(0, limit).map((f) => ({ id: f.id, claim: f.claim.slice(0, 240), tags: f.tags, hits: f.hits, pinned: Boolean(f.pinned), updatedAt: f.lastUsedAt }));
+	}
+
+	ListEpisodes(limit = 12): Array<Record<string, unknown>> {
+		return [...this.state.episodes].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, limit).map((e) => ({ id: e.id, summary: e.summary.slice(0, 240), tags: e.tags, hits: e.hits, pinned: Boolean(e.pinned), createdAt: e.createdAt }));
+	}
+
+	ListTechniques(limit = 12): Array<Record<string, unknown>> {
+		return [...this.state.techniques].sort((a, b) => score(b) - score(a)).slice(0, limit).map((t) => ({ id: t.id, name: t.name, description: t.description.slice(0, 160), hits: t.hits, expose: t.expose, pinned: Boolean(t.pinned) }));
+	}
+
+	ListCold(limit = 12): Array<Record<string, unknown>> {
+		return this.loadCold().slice(-limit).map((item) => ({ id: item.Id, kind: item.Kind, key: item.Key, reason: item.Reason.slice(0, 120), signal: item.Signal || 0, at: item.At }));
+	}
+
 	RecordUsage(event: Omit<UsageEvent, "Id" | "At"> & { At?: number }): void {
 		this.state.usage.push({
 			Id: id("use"),

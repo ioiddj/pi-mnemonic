@@ -90,6 +90,12 @@ pi -e ~/.pi/agent/extensions/pi-mnemonic/index.ts
 - `/pi-mnemonic-associate on|off|status`
 - `/pi-mnemonic-stats [json|jsonl|eval|langsmith|langfuse|otel] [path]`
 
+## Register visualization and engram compatibility
+
+`/pi-mnemonic-registers` opens a themed terminal overlay with views for registers, facts, episodes, techniques, cold storage, and usage. Use `1`-`6` to switch views, arrow/page keys to scroll, `r` to refresh, and `Esc`/`Ctrl+C` to close.
+
+When engram is also installed, pi-mnemonic detects it and reports the overlap. Modes: `coexist` (default), `mnemonic-primary`, `engram-primary`, `off`. In `engram-primary` or `off`, pi-mnemonic suppresses its context injections and idle mining. Changing mode requires operator confirmation.
+
 ## Observability
 
 Usage telemetry is **off by default**. Enable with `PiStats Enable` or `/pi-mnemonic-stats enable` (operator confirmation required). While enabled, the extension records bounded metadata only: tool/action, timestamp, duration, success/error, input/output byte counts, model id, trigger labels, and section sizes. It does not persist raw prompts, values, or command text.
@@ -125,6 +131,10 @@ When you discover a reusable trajectory or capability, call `PiMnemonicCodify` s
 Tripwire conditions are shared across tools (`src/tripwire.ts`): regex, keyword, turn count, context percent, repeated tools, manual/code predicates, and typed boolean/enum decision models. Set `prune.auto=true` to enable deterministic automatic pruning.
 
 Secrets and PII should be handled by reference only through `pi-credentials`. This extension does not attempt PII detection; redaction is defense-in-depth for command text, not a guarantee. Use `credential_set` and `{{secret:NAME}}` for credentials.
+
+## Pi TUI development docs
+
+This package vendors Pi 1.6.0 TUI documentation and UI references under `docs/pi/` and a local skill at `skills/pi-tui/SKILL.md`. Use the skill when adding or reviewing overlays, dialogs, widgets, key handling, or theming. The register browser follows those contracts: Pi theme tokens, Pi keybindings, `truncateToWidth`/`visibleWidth`, and centered `overlayOptions`.
 
 ## Development
 

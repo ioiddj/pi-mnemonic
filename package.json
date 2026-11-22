@@ -1,6 +1,6 @@
 {
   "name": "@ioiddj/pi-mnemonic",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": false,
   "type": "module",
   "description": "Bounded working memory, associative recall, metacognition tools, and editable prompt cards for Pi coding agents",
@@ -44,7 +44,10 @@
     "install.sh",
     "uninstall.sh",
     "install.ps1",
-    "uninstall.ps1"
+    "uninstall.ps1",
+    "src/browser.ts",
+    "docs/pi/**/*",
+    "skills/**/*"
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.ts",
@@ -60,7 +63,10 @@
     "extensions": [
       "./index.ts"
     ],
-    "changelogPath": "./CHANGELOG.md"
+    "changelogPath": "./CHANGELOG.md",
+    "skills": [
+      "./skills/pi-tui"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

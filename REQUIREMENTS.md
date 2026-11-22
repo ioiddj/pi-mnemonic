@@ -207,6 +207,19 @@ The extension/package keeps the required `pi-` prefix. LLM-facing tool names use
 - Supports git (default), npm, local checkout, explicit source, project-local settings, dry-run, and uninstall of all known sources.
 - Installers change only Pi settings via the Pi CLI; they do not edit settings files directly.
 
+### R23 — Register visualization and engram compatibility
+
+- `/pi-mnemonic-registers` opens a themed terminal-only overlay with views for registers, facts, episodes, techniques, cold storage, and usage.
+- The browser follows Pi TUI contracts: injected theme/keybindings, `truncateToWidth`/`visibleWidth`, bounded viewport, key-based navigation, centered `overlayOptions`, and explicit refresh/close paths.
+- pi-mnemonic detects engram via command names or package settings and reports the conflict.
+- Compatibility modes: `coexist` (default), `mnemonic-primary`, `engram-primary`, `off`. `engram-primary`/`off` suppress pi-mnemonic context sections and idle mining; mode changes require operator confirmation.
+
+### R24 — Vendored Pi TUI docs
+
+- Pi 1.6.0 TUI, theme, keybinding, RPC UI, and extension docs are vendored under `docs/pi/`.
+- Pi extension UI references and the `pi-tui` SKILL.md are vendored under `skills/pi-tui/`.
+- The package manifest exposes the skill via `pi.skills` so future work uses Pi-native UI patterns.
+
 ## Safety and bounds
 
 - All collections have explicit caps in `store.ts` and are pruned before save.

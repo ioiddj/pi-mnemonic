@@ -36,7 +36,7 @@ test("registers PascalCase tools and lowercase kebab commands", () => {
 		"PiMnemonicHelp", "PiMnemonicSet", "PiMnemonicGet", "PiMnemonicList", "PiMnemonicDelete",
 		"PiMnemonicLearn", "PiMnemonicNote", "PiMnemonicRender", "PiTechnique", "PiMnemonicWarm", "PiMnemonicRecall", "PiMnemonicCodify", "PiMnemonicLink",
 		"PiAssociate", "PiDream", "PiPlan", "PiImagine", "PiSimulate", "PiReflect", "PiObserve",
-		"PiPredict", "PiRiskAssessment", "PiAssessment", "PiQuantify", "PiModel", "PiHypothesis", "PiExperiment", "PiPrune", "PiCharter", "PiPrompt", "PiStats", "PiMnemonicStats",
+		"PiPredict", "PiRiskAssessment", "PiAssessment", "PiQuantify", "PiModel", "PiHypothesis", "PiExperiment", "PiPrune", "PiCharter", "PiPrompt", "PiStats", "PiMemoryCompat", "PiMnemonicStats",
 	]) {
 		assert.ok(tools.has(name), `missing tool ${name}`);
 	}
@@ -184,12 +184,26 @@ test("quantitative meta tools return grounded structured output", async () => {
 	assert.equal(event.systemPromptOptions.sections["pi-mnemonic-meta"], "");
 });
 
+test("engram compatibility mode suppresses overlapping context", async () => {
+	const { pi, tools, handlers } = MockPi();
+	pi.getCommands = () => [{ name: "engram-registers" }];
+	PiMnemonic(pi);
+	const ctx: any = { cwd: temp, sessionManager: { getBranch: () => [] }, getContextUsage: () => ({ tokens: 10, contextWindow: 100, percent: 10 }), ui: { notify: () => {}, confirm: async () => true } };
+	await handlers.get("session_start")({ reason: "startup" }, ctx);
+	const status = await tools.get("PiMemoryCompat").execute("1", { Action: "Status" }, undefined, undefined, ctx);
+	assert.equal(JSON.parse(status.content[0].text).Detected, true);
+	await tools.get("PiMemoryCompat").execute("2", { Action: "Set", Mode: "engram-primary" }, undefined, undefined, ctx);
+	const event: any = { messageType: "user", prompt: "hello", systemPromptOptions: { sections: {}, cwd: temp, contextFiles: [] } };
+	await handlers.get("before_agent_start")(event, ctx);
+	assert.equal(event.systemPromptOptions.sections["pi-mnemonic"], "");
+});
+
 test("PiStats reports instrumented tool usage when enabled", async () => {
 	const { pi, tools, handlers } = MockPi();
 	PiMnemonic(pi);
 	const ctx: any = { cwd: temp, sessionManager: { getBranch: () => [] }, getContextUsage: () => ({ tokens: 10, contextWindow: 100, percent: 10 }), ui: { notify: () => {}, confirm: async () => true } };
 	await handlers.get("session_start")({ reason: "startup" }, ctx);
-	await tools.get("PiMnemonicSet").execute("1", { Key: "observability.enabled", Value: "true" }, undefined, undefined, ctx);
+	await tools.get("PiStats").execute("1", { Action: "Enable" }, undefined, undefined, ctx);
 	await tools.get("PiMnemonicStats").execute("2", {}, undefined, undefined, ctx);
 	await tools.get("PiMnemonicStats").execute("3", {}, undefined, undefined, ctx);
 	const report = await tools.get("PiStats").execute("4", { Action: "Dump" }, undefined, undefined, ctx);

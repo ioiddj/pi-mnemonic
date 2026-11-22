@@ -11,6 +11,7 @@ import { Value } from "typebox/value";
 import { AssociateSectionName, BuildAssociateContext, BuildAssociations, BuildContext, BuildLinkHints, ContextSectionName, LinkSectionName, RecallSectionName } from "./src/context.ts";
 import { GenerateCounterfactuals } from "./src/imagine.ts";
 import { PromptStructured } from "./src/intelligence.ts";
+import { CreateRegisterBrowser } from "./src/browser.ts";
 import { PromptKeys, PromptSource, PromptText, ResetPromptCard, WritePromptCard } from "./src/prompt-cards.ts";
 import { DEFAULT_PROMPTS } from "./src/prompt-defaults.ts";
 import { DEFAULT_CHARTER_PATTERNS, DEFAULT_PRUNE_PATTERNS, DEFAULT_TRIGGER_PATTERNS } from "./src/tripwire.ts";
@@ -221,6 +222,7 @@ function HelpText(): string {
 		"PiPredict — evidence-grounded forecast. PiRiskAssessment / PiAssessment — quantitative risk register. PiQuantify / PiModel — bounded variable model. PiHypothesis — falsifiable hypothesis. PiExperiment — bounded experiment design, optionally run via a PiTechnique.",
 		"PiPrompt { Action: List|Get|Set|Reset, Key?, Prompt? } — edit YAML prompt cards in .config/prompts; defaults remain in src/prompt-defaults.ts.",
 		"PiPrune { Action: Preview|Run|Restore|Status|Config, Key?, Focus?, Reason?, Intelligent? } — move unused/noisy memory into cold storage; supports manual, agent, regex/keyword/code, and typed decision triggers.",
+		"PiMemoryCompat { Action: Status|Set, Mode? } — manage coexistence with engram (coexist/mnemonic-primary/engram-primary/off).",
 		"PiStats { Action: Dump|Enable|Disable|Export|Query|Reset, Format?, Path?, Limit?, SinceMs? } — opt-in usage telemetry and exports to JSON/JSONL/eval/LangSmith/Langfuse/OTel.",
 		"PiCharter { Action: Show|Config|Enable|Disable|Source, Mode?, EveryNTurns? } — operating charter with source links; default trigger mode fires only for sanctioned-party or sanctions/export-control work (modes always/trigger/periodic/off).",
 		"Pin syntax in markdown: {{key!important}}, {{key#alwayson}}, {{key//remember}} pin a register/fact/episode/technique so pruning skips it. Source index: .config/charter/SOURCES.md.",
@@ -494,6 +496,20 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 			pi.events.emit("pi-mnemonic:flush-error", { message: String(error) });
 		}
 	};
+	const HasEngram = (): boolean => {
+		try {
+			const commands = pi.getCommands?.() || [];
+			if (commands.some((command) => String((command as unknown as AnyRecord).name).includes("engram"))) return true;
+			const settings = pi.getSettings?.() as AnyRecord | undefined;
+			const packages = Array.isArray(settings?.packages) ? settings!.packages : [];
+			return packages.some((entry: unknown) => String(typeof entry === "string" ? entry : (entry as AnyRecord)?.source || "").includes("engram"));
+		} catch {
+			return false;
+		}
+	};
+	const CompatMode = (): string => String(GetStore().peek("memory.compatMode") || "coexist");
+	const ConflictInfo = () => ({ Detected: HasEngram(), Mode: CompatMode() });
+
 	const ObserveEnabled = () => GetStore().peek("observability.enabled") === true;
 	const ByteCount = (value: unknown): number => {
 		try { return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8"); } catch { return 0; }
@@ -660,7 +676,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 		}),
 		execute: Execute((params: AnyRecord) => {
 			const key = String(params.Key);
-			const reserved = ["charter.", "dream.", "prune.auto", "reflect.", "associate.", "meta.", "background."];
+			const reserved = ["charter.", "dream.", "prune.auto", "reflect.", "associate.", "meta.", "background.", "observability.enabled", "memory.compatMode"];
 			if (reserved.some((prefix) => key.startsWith(prefix))) throw new MnemonicError(`Key '${key}' is operator-controlled.`, "Use the corresponding operator tool instead.");
 			GetStore().set(key, ParseValue(String(params.Value), "Value"), (params.Tags as string[]) || []);
 			Flush();
@@ -1601,6 +1617,25 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	});
 
 	RegisterTool({
+		name: "PiMemoryCompat",
+		label: "Pi Memory Compat",
+		description: "Check or set coexistence mode when engram and pi-mnemonic are both installed.",
+		parameters: Type.Object({
+			Action: StringEnum(["Status", "Set"] as const),
+			Mode: Type.Optional(StringEnum(["coexist", "mnemonic-primary", "engram-primary", "off"] as const)),
+		}),
+		execute: Execute(async (params: AnyRecord, _signal?: AbortSignal, ctx?: any) => {
+			if (String(params.Action) === "Set") {
+				if (!params.Mode) throw new MnemonicError("Set requires Mode.", "Use coexist, mnemonic-primary, engram-primary, or off.");
+				if (!(await OperatorConfirm(ctx, "Allow changing memory coexistence mode?"))) throw new MnemonicError("Operator confirmation required.", "This affects both memory extensions.");
+				GetStore().set("memory.compatMode", String(params.Mode), ["memory", "compat"]);
+				Flush();
+			}
+			return Result(JSON.stringify(ConflictInfo(), null, 2));
+		}),
+	});
+
+	RegisterTool({
 		name: "PiStats",
 		label: "Pi Stats",
 		description: "Dump extension stats and export bounded usage rows to JSON/JSONL/eval/LangSmith/Langfuse/OTel formats. Opt-in observability.",
@@ -1645,7 +1680,7 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 				}
 				return Result(text, { format, data });
 			}
-			return Result(JSON.stringify({ Config: current.peek("observability.enabled") === true, Store: current.stats(), Usage: current.UsageStats() }, null, 2));
+			return Result(JSON.stringify({ Config: current.peek("observability.enabled") === true, Compat: ConflictInfo(), Store: current.stats(), Usage: current.UsageStats() }, null, 2));
 		}),
 	});
 
@@ -1682,6 +1717,20 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		const contextStarted = Date.now();
 		const current = GetStore();
+		const compatMode = CompatMode();
+		const engramDetected = HasEngram();
+		if (compatMode === "off" || compatMode === "engram-primary") {
+			for (const name of ["pi-mnemonic", "pi-mnemonic-associate", "pi-mnemonic-recall", "pi-mnemonic-reflect", "pi-mnemonic-meta", "pi-mnemonic-prune", "pi-mnemonic-charter"]) {
+				event.systemPromptOptions.sections[name] = "";
+			}
+			Flush();
+			return;
+		}
+		if (engramDetected) {
+			event.systemPromptOptions.sections["pi-mnemonic-compat"] = `Both engram and pi-mnemonic are active (${compatMode}). /pi-mnemonic-registers shows local registers; /engram-registers shows the engram ledger.`;
+		} else {
+			event.systemPromptOptions.sections["pi-mnemonic-compat"] = "";
+		}
 		event.systemPromptOptions.sections[ContextSectionName()] = BuildContext(current, 4000);
 		const promptText = event.messageType === "user"
 			? event.prompt
@@ -1890,12 +1939,50 @@ export default function PiMnemonic(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", async (event, ctx) => {
 		if ((event as unknown as AnyRecord).aborted) return;
+		if (["off", "engram-primary"].includes(CompatMode())) return;
 		await DreamRun(ctx, GetStore().peek("dream.autoPromote") === true);
 	});
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
 		Flush();
+	});
+
+	pi.registerCommand("pi-mnemonic-registers", {
+		description: "Browse pi-mnemonic registers in a terminal-only overlay",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
+				ctx.ui.notify("/pi-mnemonic-registers needs an interactive Pi session", "error");
+				return;
+			}
+			await ctx.ui.custom<void>(
+				(tui: any, theme: any, keybindings: any, done: () => void) => CreateRegisterBrowser(GetStore(), ConflictInfo(), tui, theme, keybindings, done) as any,
+				{
+					overlay: true,
+					overlayOptions: { anchor: "center", width: 78, maxHeight: 22 },
+					blocked: { kind: "question", message: "Browsing pi-mnemonic registers" },
+				},
+			);
+		},
+	});
+
+	pi.registerCommand("pi-mnemonic-compat", {
+		description: "Show or set engram compatibility: /pi-mnemonic-compat [coexist|mnemonic-primary|engram-primary|off]",
+		handler: async (args, ctx) => {
+			const mode = args.trim();
+			const allowed = ["coexist", "mnemonic-primary", "engram-primary", "off"];
+			if (mode && !allowed.includes(mode)) {
+				ctx.ui.notify(`Invalid mode: ${mode}`, "error");
+				return;
+			}
+			if (mode && !(await OperatorConfirm(ctx, "Allow changing memory coexistence mode?"))) return;
+			if (mode) {
+				GetStore().set("memory.compatMode", mode, ["memory", "compat"]);
+				Flush();
+			}
+			const info = ConflictInfo();
+			ctx.ui.notify(`engram ${info.Detected ? "detected" : "not detected"} • mode ${info.Mode}`, "info");
+		},
 	});
 
 	pi.registerCommand("pi-mnemonic-stats", {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.0] - 2026-11-22
+
+- Added `/pi-mnemonic-registers` themed TUI overlay for local memory inspection.
+- Added engram conflict detection and `PiMemoryCompat` / `/pi-mnemonic-compat` coexistence modes.
+- Vendored Pi 1.6.0 TUI docs, UI references, examples, and a local `pi-tui` SKILL.md.
+
 ## [0.3.0] - 2026-11-22
 
 - Added cross-platform install/uninstall scripts (`install.sh`, `uninstall.sh`, `install.ps1`, `uninstall.ps1`, Node installer).
